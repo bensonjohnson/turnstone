@@ -246,7 +246,12 @@ class HeadlessSession(ChatSession):
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         tool_overrides: dict[str, dict[str, Any]] | None = None,
+        **session_kwargs: Any,
     ) -> None:
+        # ``session_kwargs`` forwards straight to ``ChatSession`` so
+        # specialised eval sessions (the coordinator-mode nudge harness)
+        # can pass ``kind`` / ``coord_client`` / ``ws_id`` / ``user_id``
+        # without this class re-enumerating the whole constructor.
         super().__init__(
             client=client,
             model=model,
@@ -261,6 +266,7 @@ class HeadlessSession(ChatSession):
             auto_compact_pct=auto_compact_pct,
             agent_max_turns=agent_max_turns,
             tool_truncation=tool_truncation,
+            **session_kwargs,
         )
         self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
@@ -302,9 +308,25 @@ class HeadlessSession(ChatSession):
         Returns the tool call log: list of dicts with keys:
             tool: str, args: dict, result: str (truncated), turn: int
         """
-        self.tool_call_log = []
         self.messages.append(Turn.user(user_input))
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+        return self._run_headless_loop(max_turns=max_turns, verbose=verbose, log_prefix=log_prefix)
+
+    def _run_headless_loop(
+        self,
+        *,
+        max_turns: int = 10,
+        verbose: bool = False,
+        log_prefix: str = "",
+    ) -> list[dict[str, Any]]:
+        """The completion + tool loop shared by :meth:`send_headless`
+        (which appends a fresh user turn first) and the nudge eval's
+        wake-equivalent entry (which seeds ``self.messages`` directly —
+        an empty wake user turn followed by injected system turns,
+        mirroring ``send("", from_wake=True)``'s wire order — and must
+        NOT append another user turn).
+        """
+        self.tool_call_log = []
 
         # The eval lane — resolved once per run, like the sub-agent seam.
         # ``temperature`` relays the harness's operator-resolved knob per
