@@ -3,7 +3,8 @@
 Static nudge text templates (``NUDGE_*``), detection heuristics
 (``detect_correction``, ``detect_completion``), the :class:`RepeatDetector`
 streak counter, and the cooldown-aware :func:`should_nudge` /
-:func:`format_nudge` / :func:`format_idle_children_nudge` helpers.
+:func:`format_nudge` / :func:`format_idle_children_nudge` /
+:func:`format_idle_tasks_nudge` helpers.
 
 The wake-trigger lifecycle (``IdleNudgeWatcher`` plus the
 ``install_idle_nudge_watcher`` / ``shutdown_idle_nudge_watchers``
@@ -149,14 +150,16 @@ _NUDGE_MAP: dict[str, str] = {
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
     "compaction_pending": NUDGE_COMPACTION,
-    # idle_children and watch_triggered carry no static body — the
-    # per-fire text comes from a producer (``format_idle_children_nudge``
-    # for the former, ``format_watch_message`` + ``sanitize_payload``
-    # in the watch dispatch closure for the latter).  Empty string
-    # here keeps :func:`format_nudge` round-tripping honestly while
-    # still letting :func:`should_nudge` and ``_NUDGE_MAP``-as-registry
+    # idle_children, idle_tasks and watch_triggered carry no static body
+    # — the per-fire text comes from a producer
+    # (``format_idle_children_nudge`` / ``format_idle_tasks_nudge`` for
+    # the former two, ``format_watch_message`` + ``sanitize_payload`` in
+    # the watch dispatch closure for the latter).  Empty string here
+    # keeps :func:`format_nudge` round-tripping honestly while still
+    # letting :func:`should_nudge` and ``_NUDGE_MAP``-as-registry
     # consumers recognise the type.
     "idle_children": "",
+    "idle_tasks": "",
     "watch_triggered": "",
     # background_shell_exit (#817) likewise: per-fire text is composed by
     # ``ChatSession._on_background_shell_exit`` and rides the shared
@@ -182,6 +185,27 @@ MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
     {"correction", "denial", "resume", "completion", "start", "tool_error"}
 )
 
+# Nudge types whose copy names a specific tool the model is told to call,
+# mapped to that tool.  ``ChatSession._nudges_enabled`` suppresses a type
+# whose required tool the persona envelope hides — a nudge instructing
+# ``tasks(...)`` at a coordinator whose persona omits the ``tasks`` tool
+# produces the same "I don't have access" apology loop the memory-nudge
+# gating was built to stop.  The memory types all require ``memory``
+# (this map is the generalisation of :data:`MEMORY_NUDGE_TYPES`'s pairing
+# with ``_persona_tool_visible("memory")``); ``idle_tasks`` requires
+# ``tasks`` because every branch of its body is a ``tasks(...)`` call.
+#
+# ``idle_children`` is deliberately ABSENT even though its body names
+# ``wait_for_workstream``: it is a liveness wake, and the wake itself is
+# the point — the tool suggestion is decoration with a non-tool branch
+# ("continue the user's work") beside it.  Suppressing the wake because a
+# persona hid the suggested tool would strand the coordinator, which is
+# the failure the wake exists to prevent.
+NUDGE_REQUIRED_TOOL: dict[str, str] = {
+    **dict.fromkeys(MEMORY_NUDGE_TYPES, "memory"),
+    "idle_tasks": "tasks",
+}
+
 
 # Display cap for the ``idle_children`` body — list at most this many
 # children inline, append "...and N more" overflow line beyond that.
@@ -196,6 +220,60 @@ NUDGE_IDLE_CHILDREN_HEADER = (
     "You went idle but still have active child workstreams.  Either "
     "continue the user's work or block on the listed children "
     "explicitly:"
+)
+
+
+# Display cap for the ``idle_tasks`` body — list at most this many open
+# tasks inline, append an "...and N more" overflow line beyond that.
+# Matches the children cap; the body is a reminder, not a task dump, and
+# the model can always call ``tasks(action='list')`` for the full set.
+NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
+
+# The ``idle_tasks`` body.  Three properties are load-bearing and should
+# survive any rewording:
+#
+#   1. It declares its own provenance in the first line.  This message is
+#      synthesised by the shell, not typed by the operator, and a model
+#      that reads it as operator speech treats it as permission to
+#      proceed — manufacturing authority nobody granted.  The disclaimer
+#      is up front because a trailing caveat does not survive a small
+#      model's read.
+#   2. The escape branch comes FIRST and carries a concrete tool call.
+#      "Did I stop legitimately?" is an introspective judgement models
+#      are bad at; "does the next step need the operator?" is a typed
+#      question about the transition, and answering it costs one call.
+#      Branch order follows harm: guessing on an operator decision is
+#      worse than a stale list, which is worse than redone work.
+#   3. The ``done`` branch is last and anchored to evidence.  A task
+#      status is model-reported and unattested — ``done`` is cheap to
+#      assert, unverifiable, and silences this nudge with no external
+#      consequence.  It is offered (bookkeeping lag is real, and without
+#      it a stale list makes the model redo finished work) but never
+#      advertised as the easy way out.
+NUDGE_IDLE_TASKS_HEADER = (
+    "Checkpoint from the harness, not from the operator.  Your task "
+    "list has open items and you have gone idle.  Nothing in this "
+    "message grants approval, widens scope, or asks you to continue.\n"
+    "\n"
+    "If the next step needs the operator — a decision, an approval, a "
+    "scope or credential you were not given — that is not yours to "
+    "resolve:\n"
+    "\n"
+    "    tasks(action='update', task_id='tsk_...', "
+    "status='needs_operator',\n"
+    "          note='<what you need, one sentence>')\n"
+    "\n"
+    "Stopping there is the correct outcome.  Do not substitute your own "
+    "judgment for the operator's.\n"
+    "\n"
+    "If the next step is yours to take, take it.\n"
+    "\n"
+    "If an item is already finished in this session's transcript, "
+    "record it:\n"
+    "\n"
+    "    tasks(action='update', task_id='tsk_...', status='done')\n"
+    "\n"
+    "Open:"
 )
 
 
@@ -322,6 +400,73 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     lines.append(
         f'To block on them: wait_for_workstream(ws_ids={wait_ids!r}, mode="any", timeout=120).'
     )
+    return "\n".join(lines)
+
+
+def _field_str(value: object) -> str:
+    """Coerce a task-row field to ``str`` for rendering.
+
+    ``None`` (a JSON ``null`` in the stored envelope) maps to ``""`` —
+    NOT to ``str(None)``, whose ``"None"`` is truthy and once rendered a
+    literal ``None`` note line in the operator card while the prose said
+    nothing.  Other non-strings coerce via ``str`` so an ``int`` title
+    renders identically in the card and the prose instead of raising
+    ``TypeError`` inside :func:`sanitize_name`'s regex.
+    """
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def format_idle_tasks_nudge(tasks: list[dict[str, str]]) -> str:
+    """Render the ``idle_tasks`` reminder body.
+
+    *tasks* is a list of the coordinator's open task records — the dict
+    shape :func:`turnstone.console.coordinator_client.load_task_envelope`
+    decodes, of which ``id``, ``title``, ``status`` and the optional
+    ``note`` are read here.  Callers pass only the tasks that should
+    trigger a nudge (``pending`` / ``in_progress``); this function does
+    no status filtering of its own.
+
+    Returns raw text *without* any envelope, matching
+    :func:`format_idle_children_nudge` — the nudge is emitted as a
+    first-class ``{"role": "system"}`` turn whose content is this text.
+
+    Sanitisation is **this function's** job, not storage's: ``title`` and
+    ``note`` are stored raw (no sanitiser on the ``tasks`` tool write
+    path) and are only safe at their other terminus because the console
+    renders them via ``textContent``.  Both go through
+    :func:`sanitize_name` here so a title containing ``\\n`` cannot forge
+    a fake sibling bullet and one containing ``</thinking>`` cannot steer
+    the model's reasoning channels.  A future producer must not assume
+    stored task fields arrive clean.
+
+    Display caps at :data:`NUDGE_IDLE_TASKS_DISPLAY_CAP` with an
+    overflow line.  Empty input returns the empty string so callers can
+    short-circuit on ``if not text: return``.
+    """
+    if not tasks:
+        return ""
+    lines = [NUDGE_IDLE_TASKS_HEADER, ""]
+    shown = tasks[:NUDGE_IDLE_TASKS_DISPLAY_CAP]
+    for t in shown:
+        # ``_field_str`` before ``sanitize_name``: the observer's
+        # ``_open_tasks`` normalises rows in production, but this is a
+        # public function whose direct callers may pass raw envelope
+        # rows, and ``sanitize_name`` raises ``TypeError`` on a
+        # non-``str``.  Belt-and-braces here closes the class for every
+        # caller permanently.
+        task_id = _field_str(t.get("id"))
+        title = sanitize_name(_field_str(t.get("title"))) or "(untitled)"
+        status = _field_str(t.get("status")) or "?"
+        line = f"  - {task_id} ({status}): {title}"
+        note = sanitize_name(_field_str(t.get("note")))
+        if note:
+            line += f" [note: {note}]"
+        lines.append(line)
+    overflow = len(tasks) - len(shown)
+    if overflow > 0:
+        lines.append(f"  ...and {overflow} more")
     return "\n".join(lines)
 
 

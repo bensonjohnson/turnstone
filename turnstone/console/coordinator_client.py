@@ -179,7 +179,40 @@ _WS_REF_ECHO_CLIP: int = 48
 # fail in one wait call.
 _WS_REF_ERROR_TEXT_CAP: int = 2000
 
-_TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
+# Single source of truth for the task-status vocabulary.  Every status
+# MUST be classified here — ``_TASK_STATUSES`` (the validation set) and
+# ``TASK_OPEN_STATUSES`` (the idle-tasks nudge trigger set) are both
+# derived, so adding a value without deciding whether it counts as
+# unfinished work is impossible by construction.  The remaining surfaces
+# that cannot derive from Python (``tools/tasks.json``'s enum, the JS
+# ``TASK_STATUS_LABELS`` map, the ``.status-*`` CSS rules) are pinned to
+# this dict by cross-surface tests, so a new status fails CI until every
+# surface knows it.
+#
+# ``blocked`` and ``needs_operator`` are deliberately distinct, and the
+# split is the whole point of the second value: ``blocked`` is waiting on
+# a dependency the coordinator may be able to clear itself (a build, a
+# sibling task, a child still running) — open=False because nudging is
+# noise while the dependency stands, but the model owns it.
+# ``needs_operator`` is waiting on a decision, approval, or grant that
+# ONLY the operator can make — open=False because nudging there pushes
+# the model to guess on a question it correctly escalated, the exact
+# failure the idle-tasks nudge exists to prevent.  Exclusion from the
+# trigger set is NOT suppression of the nudge: a coord holding one
+# ``needs_operator`` task and one ``pending`` task still fires, on the
+# strength of the pending one — the alternative (any ``needs_operator``
+# task parks the coord) lets one stale escalation silence it permanently.
+_TASK_STATUS_IS_OPEN: dict[str, bool] = {
+    "pending": True,
+    "in_progress": True,
+    "done": False,
+    "blocked": False,
+    "needs_operator": False,
+}
+_TASK_STATUSES = frozenset(_TASK_STATUS_IS_OPEN)
+TASK_OPEN_STATUSES: frozenset[str] = frozenset(
+    status for status, is_open in _TASK_STATUS_IS_OPEN.items() if is_open
+)
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
 # hazard.  Hitting the cap is an explicit signal to prune done/blocked rows.
@@ -189,6 +222,27 @@ _TASKS_MAX = 500
 # under its nose masks real planning bugs (the model may rely on the
 # title it SENT, not the stored one).
 _TASK_TITLE_MAX = 200
+# Max task note length.  Same limit and the same reject-don't-truncate
+# rule as the title: a note carries the coordinator's one-sentence ask to
+# the operator, which is precisely the string where silent trimming loses
+# the information the field exists to carry.  One number rather than two
+# so the schema has one sentence to explain.
+_TASK_NOTE_MAX = 200
+
+
+def _too_long_error(field: str, length: int, cap: int) -> dict[str, Any]:
+    """The shared reject-don't-truncate error for over-cap task fields.
+
+    One builder for title and note in both ``tasks_add`` and
+    ``tasks_update`` so the message, the cap reference, and the
+    measure-after-strip rule can never drift between the four sites.
+    Silent truncation is the alternative being refused: mutating the
+    coordinator's planning state under its nose masks real planning bugs
+    (the model may rely on the value it SENT, not the stored one).
+    """
+    return {"error": (f"{field} too long ({length} chars, max {cap}).  Shorten and retry.")}
+
+
 # Short TTL on the per-ws_id live-inspect cache.  Back-to-back inspect()
 # calls in a model's tool loop hit this hot-path; 2s is short enough
 # that cached data stays meaningful to a human watching output and long
@@ -1643,24 +1697,18 @@ class CoordinatorClient:
         title: str,
         status: str = "pending",
         child_ws_id: str = "",
+        note: str = "",
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
         clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
-        # Reject overlong titles rather than silently truncating —
-        # mutating the coordinator's planning state under its nose
-        # masks real planning bugs (the model may rely on the title it
-        # SENT, not the stored one).  Callers that want a long title
-        # must shorten it themselves.
+        clean_note = (note or "").strip()
+        if len(clean_note) > _TASK_NOTE_MAX:
+            return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
         if len(clean_title) > _TASK_TITLE_MAX:
-            return {
-                "error": (
-                    f"title too long ({len(clean_title)} chars, max "
-                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
-                )
-            }
+            return _too_long_error("title", len(clean_title), _TASK_TITLE_MAX)
         if status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
@@ -1689,6 +1737,20 @@ class CoordinatorClient:
                 "created": now,
                 "updated": now,
             }
+            # ``note`` is written only when non-empty, so the key is
+            # absent on the overwhelming majority of rows.  The full
+            # envelope is read and re-serialised on every mutation and
+            # fed back to the model by ``tasks(action='list')``, where
+            # ``tasks`` sits in ``_STRUCTURAL_FLOOR_TOOLS`` — an
+            # always-present ``"note": ""`` on 200 rows would spend
+            # budget on nothing and push the result closer to the
+            # head+tail floor, which cuts mid-JSON.  Readers must
+            # therefore treat the key as absent-by-default (there is no
+            # backfill for rows written before this field existed); the
+            # HTTP response model still defaults it to "" so the FE sees
+            # a stable shape.
+            if clean_note:
+                task["note"] = clean_note
             envelope["tasks"].append(task)
             self._save_tasks(ws_id, envelope)
             return task
@@ -1701,11 +1763,17 @@ class CoordinatorClient:
         title: str | None = None,
         status: str | None = None,
         child_ws_id: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
         if status is not None and status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
+        clean_note: str | None = None
+        if note is not None:
+            clean_note = note.strip()
+            if len(clean_note) > _TASK_NOTE_MAX:
+                return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
@@ -1717,17 +1785,23 @@ class CoordinatorClient:
                         if not clean:
                             return {"error": "title cannot be empty"}
                         if len(clean) > _TASK_TITLE_MAX:
-                            return {
-                                "error": (
-                                    f"title too long ({len(clean)} chars, max "
-                                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
-                                )
-                            }
+                            return _too_long_error("title", len(clean), _TASK_TITLE_MAX)
                         t["title"] = clean
                     if status is not None:
                         t["status"] = status
                     if child_ws_id is not None:
                         t["child_ws_id"] = child_ws_id
+                    if clean_note is not None:
+                        # ``note`` follows ``child_ws_id``, not ``title``:
+                        # it is optional, so an empty string is a CLEAR
+                        # rather than an error.  Deleting the key instead
+                        # of storing "" keeps the absent-by-default shape
+                        # ``tasks_add`` writes, so a cleared note costs
+                        # the same as one that never existed.
+                        if clean_note:
+                            t["note"] = clean_note
+                        else:
+                            t.pop("note", None)
                     t["updated"] = _utc_now_iso()
                     self._save_tasks(ws_id, envelope)
                     # t is a dict pulled out of a json-decoded list; mypy
@@ -1755,71 +1829,6 @@ class CoordinatorClient:
                 return {"error": f"task not found: {task_id}"}
             self._save_tasks(ws_id, envelope)
             return {"ok": True, "task_id": task_id}
-
-    def cleanup_dead_task_child_refs(self, ws_id: str) -> int:
-        """Clear ``child_ws_id`` pointers on tasks whose referenced
-        workstream no longer exists in storage.  Returns the number of
-        links blanked (0 if nothing needed doing, envelope was corrupt,
-        or the lookup failed).
-
-        Called by :meth:`SessionManager.close` after the state
-        transition — the task envelope is a per-coordinator planning
-        structure, so cross-coord scope guards don't apply the same way
-        they do for add/update/remove.  Held under the same per-ws
-        ``_task_lock`` as add/update/remove/reorder so a close racing
-        an in-flight mutation can't lose the mutation (#bug-6).
-        """
-        with self._task_lock(ws_id):
-            envelope, corrupt = load_task_envelope(self._storage, ws_id)
-            if corrupt:
-                return 0
-            tasks = envelope.get("tasks") or []
-            if not tasks:
-                return 0
-            candidate_ids = sorted(
-                {
-                    str(t.get("child_ws_id") or "")
-                    for t in tasks
-                    if isinstance(t, dict) and t.get("child_ws_id")
-                }
-            )
-            if not candidate_ids:
-                return 0
-            try:
-                existing_rows = self._storage.get_workstreams_batch(candidate_ids)
-            except Exception:
-                log.debug(
-                    "coord_client.task_ref_batch_failed ws=%s",
-                    ws_id,
-                    exc_info=True,
-                )
-                return 0
-            dead_ids = {cid for cid in candidate_ids if existing_rows.get(cid) is None}
-            if not dead_ids:
-                return 0
-            blanked = 0
-            for t in tasks:
-                if isinstance(t, dict) and str(t.get("child_ws_id") or "") in dead_ids:
-                    t["child_ws_id"] = ""
-                    blanked += 1
-            if not blanked:
-                return 0
-            try:
-                self._save_tasks(ws_id, envelope)
-            except Exception:
-                # Write-side divergence — the task envelope on disk
-                # now disagrees with what the close path intended.
-                # Bump to warning (not debug) so operators see it;
-                # read-side corruption (already silent on load) stays
-                # at debug.  #q-6.
-                log.warning(
-                    "coord_client.task_ref_save_failed ws=%s blanked=%d",
-                    ws_id,
-                    blanked,
-                    exc_info=True,
-                )
-                return 0
-            return blanked
 
     def tasks_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the

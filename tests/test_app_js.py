@@ -3397,3 +3397,18 @@ def test_reload_toast_console_phrasing_pins() -> None:
     assert '"Reload sent to console"' in js
     assert '"; console reload failed"' in js
     assert "!consoleFailed &&" in js
+
+
+def test_carded_nudge_kinds_have_fallback_labels() -> None:
+    """Card dispatch is guarded on the turn carrying ``meta``, so a
+    replayed turn whose persisted ``_source_meta`` is absent falls
+    through to the plain bubble and DOES reach ``operatorSourceLabel``.
+    Carded kinds therefore still need an entry, or that path leaks the
+    raw ``_source`` ("operator · idle_children") — the regression the
+    helper exists to prevent.  ``idle_children`` and ``idle_tasks`` are
+    siblings and must be present together; one without the other is how
+    the two drift."""
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    assert 'idle_children: "idle children"' in utils
+    assert 'idle_tasks: "open tasks"' in utils

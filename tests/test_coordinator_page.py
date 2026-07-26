@@ -477,11 +477,53 @@ def test_coord_retry_walk_skips_operator_context_cards():
     for builder, cls in (
         ("appendGuardFinding", '"msg guard-finding operator-context"'),
         ("appendIdleChildren", '"msg idle-children operator-context"'),
+        ("appendIdleTasks", '"msg idle-tasks operator-context"'),
     ):
         assert cls in body, (
             f"{builder} must tag its card with the shared operator-context "
             f"marker ({cls}) or the retry walk won't skip it."
         )
+
+
+def test_coordinator_js_dispatches_idle_tasks_to_its_card():
+    """``renderSystemTurn`` is shared by the live SSE handler and history
+    replay, so a missing branch means the card paints live but degrades to a
+    plain labelled bubble on refresh — the exact live-vs-replay drift the
+    dispatcher exists to prevent."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'if (source === "idle_tasks" && m) return appendIdleTasks(m);' in body, (
+        "renderSystemTurn must route idle_tasks to its structured card."
+    )
+    # The role literal now reaches the DOM through the shared builder's
+    # ``tsRole`` parameter rather than an inline setAttribute, so pin the
+    # argument at the call site instead.
+    idx = body.index("function appendIdleTasks(")
+    assert '"idle_tasks",' in body[idx : idx + 1400], (
+        "appendIdleTasks must pass its data-ts-role to buildIdleCard for the "
+        "headless render checks."
+    )
+
+
+def test_idle_cards_share_one_style_block():
+    """``idle_children`` and ``idle_tasks`` are the same class of notice and
+    share grouped CSS rules — pinned so a restyle of one can't silently skip
+    the other, which is how the two cards would drift apart visually."""
+    from pathlib import Path
+
+    css = (Path(__file__).resolve().parent.parent / "turnstone/shared_static/chat.css").read_text(
+        encoding="utf-8"
+    )
+    for shared_rule in (
+        ".msg.idle-children .msg-idle-header,\n.msg.idle-tasks .msg-idle-header",
+        ".msg.idle-children .msg-idle-list,\n.msg.idle-tasks .msg-idle-list",
+        ".msg.idle-children .msg-idle-child,\n.msg.idle-tasks .msg-idle-child",
+    ):
+        assert shared_rule in css, f"idle cards must share the rule: {shared_rule!r}"
 
 
 def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
@@ -1155,3 +1197,123 @@ def test_coordinator_js_gates_send_on_cross_user_busy():
         Path(__file__).resolve().parents[1] / "turnstone/shared_static/composer_queue.js"
     ).read_text(encoding="utf-8")
     assert 'status === "cross_user_interjection"' in helper
+
+
+def test_task_status_vocabulary_is_pinned_across_every_surface():
+    """A new task status must be classified on EVERY surface or fail CI.
+
+    ``_TASK_STATUS_IS_OPEN`` in coordinator_client.py is the source of
+    truth; ``_TASK_STATUSES`` and ``TASK_OPEN_STATUSES`` derive from it,
+    so the observer's trigger set can't drift.  The three surfaces that
+    cannot derive from Python — the model-facing JSON enum, the JS label
+    map, and the CSS chip rules — are pinned here instead.  Without this
+    a new status silently defaults to "not open" in the observer (no
+    nudge ever fires for it) and to the neutral unlabelled chip in the
+    pane, with no test or type error anywhere.
+    """
+    import json
+    from pathlib import Path
+
+    from turnstone.console.coordinator_client import _TASK_STATUS_IS_OPEN, TASK_OPEN_STATUSES
+
+    root = Path(__file__).resolve().parent.parent
+    statuses = set(_TASK_STATUS_IS_OPEN)
+
+    # The derived sets stay consistent with the classification.
+    assert {s for s, is_open in _TASK_STATUS_IS_OPEN.items() if is_open} == TASK_OPEN_STATUSES
+
+    # 1. The model-facing tool schema enum.
+    schema = json.loads((root / "turnstone/tools/tasks.json").read_text(encoding="utf-8"))
+    assert set(schema["parameters"]["properties"]["status"]["enum"]) == statuses
+
+    # 2. The JS label map — every status needs operator-facing text, or
+    #    the chip renders the raw machine string.
+    coord_js = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    labels_block = coord_js.split("const TASK_STATUS_LABELS = {", 1)[1].split("};", 1)[0]
+    labelled = {line.split(":", 1)[0].strip() for line in labels_block.splitlines() if ":" in line}
+    assert labelled == statuses, "TASK_STATUS_LABELS must cover exactly the Python statuses"
+
+    # 3. The CSS chip rules.  ``pending`` intentionally has no rule (it
+    #    falls back to the neutral base chip), so every OTHER status needs
+    #    one or it is visually indistinguishable from pending.
+    css = (root / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
+        encoding="utf-8"
+    )
+    for status in statuses - {"pending"}:
+        assert f".status-{status}" in css, f"status {status!r} needs a chip rule"
+
+
+def test_needs_operator_chip_darkens_warn_for_contrast():
+    """Raw ``var(--warn)`` on ``--warn-soft`` measures ~3.6:1 in the light
+    theme — under the 4.5:1 AA floor that applies at this chip's
+    10px/600/uppercase, and the worst of the four status chips on the one
+    status whose whole purpose is to be noticed.  The house color-mix
+    darkening (same one the .risk chips use) puts it at ~5.0:1."""
+    from pathlib import Path
+
+    css = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coord-chrome.css"
+    ).read_text(encoding="utf-8")
+    block = css.split(".task-row .status-needs_operator {", 1)[1].split("}", 1)[0]
+    assert "color-mix(in srgb, var(--warn) 70%, var(--ink-2))" in block, (
+        "needs_operator chip text must darken --warn or it fails AA in the light theme"
+    )
+    assert "color: var(--warn);" not in block
+
+
+def test_task_note_wraps_in_both_surfaces():
+    """The same model-authored note renders in the sidebar and in the
+    idle-tasks card.  A ``needs_operator`` ask is exactly where an
+    unbroken token lands (a URL, a path), and flex items default to
+    ``min-width: auto`` — so without word-break the sidebar row is forced
+    past its fixed width."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pane_css = (root / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
+        encoding="utf-8"
+    )
+    card_css = (root / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+
+    pane_block = pane_css.split(".task-row .meta {", 1)[1].split("}", 1)[0]
+    card_block = card_css.split(".msg.idle-tasks .msg-idle-note {", 1)[1].split("}", 1)[0]
+    assert "word-break: break-word" in pane_block
+    assert "word-break: break-word" in card_block
+
+
+def test_idle_cards_share_one_dom_builder():
+    """The two cards share grouped CSS *and* a DOM builder — pinned so a
+    change to one card's accessibility attributes or scroll behaviour
+    cannot silently skip the other."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert "function buildIdleCard(" in body
+    for caller in ("function appendIdleChildren(", "function appendIdleTasks("):
+        idx = body.index(caller)
+        assert "buildIdleCard(" in body[idx : idx + 1400], (
+            f"{caller} must delegate to the shared builder"
+        )
+
+
+def test_idle_tasks_card_uses_the_shared_status_label():
+    """The conversation card and the sidebar chip must show one name per
+    state — ``in_progress`` in one place and ``in progress`` in the other
+    is two names for one thing on one screen."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert "function taskStatusLabel(" in body
+    idx = body.index("function appendIdleTasks(")
+    assert "taskStatusLabel(" in body[idx : idx + 1400]
+    idx_row = body.index("function renderTaskRow(")
+    assert "taskStatusLabel(" in body[idx_row : idx_row + 1400]

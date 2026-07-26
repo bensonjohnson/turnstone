@@ -2564,135 +2564,6 @@ def test_wait_progress_callback_errors_dont_break_loop(populated_storage):
 
 
 # ---------------------------------------------------------------------------
-# cleanup_dead_task_child_refs (#bug-6, #13)
-# ---------------------------------------------------------------------------
-
-
-def _save_tasks(storage: SQLiteBackend, ws_id: str, tasks: list[dict[str, Any]]) -> None:
-    """Helper: persist a minimal task envelope for a coordinator."""
-    storage.save_workstream_config(
-        ws_id,
-        {"tasks": json.dumps({"version": 1, "tasks": tasks}, separators=(",", ":"))},
-    )
-
-
-def test_cleanup_dead_task_child_refs_blanks_dead_links(populated_storage):
-    """Tasks whose child_ws_id references a missing workstream get the
-    link blanked; tasks with live links (or no link) are untouched."""
-    client = _make_read_client(populated_storage)
-    _save_tasks(
-        populated_storage,
-        "coord-1",
-        [
-            {"id": "t1", "title": "alive-linked", "status": "done", "child_ws_id": "child-a"},
-            {"id": "t2", "title": "dead-linked", "status": "done", "child_ws_id": "ghost-xyz"},
-            {"id": "t3", "title": "unlinked", "status": "pending", "child_ws_id": ""},
-        ],
-    )
-    blanked = client.cleanup_dead_task_child_refs("coord-1")
-    assert blanked == 1
-    envelope = client.tasks_get("coord-1")
-    tasks_by_id = {t["id"]: t for t in envelope["tasks"]}
-    # Live link preserved.
-    assert tasks_by_id["t1"]["child_ws_id"] == "child-a"
-    # Dead link blanked.
-    assert tasks_by_id["t2"]["child_ws_id"] == ""
-    # Unlinked task untouched.
-    assert tasks_by_id["t3"]["child_ws_id"] == ""
-
-
-def test_cleanup_dead_task_child_refs_all_alive_is_noop(populated_storage):
-    """When every child_ws_id resolves, the cleanup returns 0 and does
-    not rewrite the envelope (we verify via a no-op save spy)."""
-    client = _make_read_client(populated_storage)
-    _save_tasks(
-        populated_storage,
-        "coord-1",
-        [{"id": "t1", "title": "alive", "status": "done", "child_ws_id": "child-a"}],
-    )
-    saves: list[dict[str, str]] = []
-    real_save = populated_storage.save_workstream_config
-
-    def _spy_save(ws_id, cfg):  # type: ignore[no-untyped-def]
-        saves.append(cfg)
-        return real_save(ws_id, cfg)
-
-    populated_storage.save_workstream_config = _spy_save  # type: ignore[method-assign]
-    try:
-        blanked = client.cleanup_dead_task_child_refs("coord-1")
-    finally:
-        populated_storage.save_workstream_config = real_save  # type: ignore[method-assign]
-    assert blanked == 0
-    assert saves == []
-
-
-def test_cleanup_dead_task_child_refs_empty_envelope(populated_storage):
-    """A coordinator with no tasks persisted returns 0 without
-    raising — the cleanup runs on every close, including those that
-    never used the tasks tool."""
-    client = _make_read_client(populated_storage)
-    blanked = client.cleanup_dead_task_child_refs("coord-1")
-    assert blanked == 0
-
-
-def test_cleanup_dead_task_child_refs_corrupt_envelope_skips(populated_storage):
-    """A corrupt envelope (unparseable JSON in workstream_config.tasks)
-    returns 0 rather than raising — the cleanup is best-effort and
-    must not block the close flow."""
-    populated_storage.save_workstream_config("coord-1", {"tasks": "{not json"})
-    client = _make_read_client(populated_storage)
-    assert client.cleanup_dead_task_child_refs("coord-1") == 0
-
-
-def test_cleanup_dead_task_child_refs_uses_task_lock(populated_storage):
-    """The cleanup must acquire the same per-ws _task_lock that
-    tasks_add/update/remove/reorder hold, so a close racing an
-    in-flight mutation can't lose writes (#bug-6).  Verified by
-    swapping the cached lock for a stand-in that records acquisition."""
-    client = _make_read_client(populated_storage)
-
-    class _RecordingLock:
-        """Mimics threading.Lock — counts __enter__ / __exit__ pairs."""
-
-        def __init__(self) -> None:
-            self.acquired = 0
-            self.released = 0
-
-        def __enter__(self) -> _RecordingLock:
-            self.acquired += 1
-            return self
-
-        def __exit__(self, *exc: Any) -> None:
-            self.released += 1
-
-    recording = _RecordingLock()
-    # Prime the cache under the cache-lock so the client's _task_lock()
-    # lookup returns our stand-in instead of allocating a real Lock.
-    with client._task_lock_cache_lock:
-        client._task_lock_cache["coord-1"] = recording  # type: ignore[assignment]
-    client.cleanup_dead_task_child_refs("coord-1")
-    assert recording.acquired == 1
-    assert recording.released == 1
-
-
-def test_cleanup_dead_task_child_refs_storage_batch_failure_swallows(populated_storage):
-    """If get_workstreams_batch raises, the cleanup returns 0 rather
-    than propagating — close flow is resilient to storage hiccups."""
-    client = _make_read_client(populated_storage)
-    _save_tasks(
-        populated_storage,
-        "coord-1",
-        [{"id": "t1", "title": "dead", "status": "done", "child_ws_id": "ghost"}],
-    )
-
-    def _boom(ws_ids):  # type: ignore[no-untyped-def]
-        raise RuntimeError("storage down")
-
-    populated_storage.get_workstreams_batch = _boom  # type: ignore[method-assign]
-    assert client.cleanup_dead_task_child_refs("coord-1") == 0
-
-
-# ---------------------------------------------------------------------------
 # inspect_workstream — three-tier output compression
 # ---------------------------------------------------------------------------
 #
@@ -3040,3 +2911,92 @@ def test_format_inspect_tiered_full_tier_omits_tier_note():
     parsed = json.loads(out)
     assert parsed["_tier"] == "full"
     assert "_tier_note" not in parsed
+
+
+# ---------------------------------------------------------------------------
+# needs_operator status + note field
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_add_accepts_needs_operator_status(tmp_path):
+    """The status that marks a task as parked on the operator — the one
+    signal the idle-tasks nudge gates on."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="pick a backend", status="needs_operator")
+    assert "error" not in task
+    assert task["status"] == "needs_operator"
+
+
+def test_tasks_add_still_rejects_unknown_status(tmp_path):
+    client = _task_client(tmp_path)
+    assert "error" in client.tasks_add("coord-1", title="t", status="needs-operator")
+
+
+def test_tasks_add_omits_note_key_when_unset(tmp_path):
+    """Absent-by-default keeps the envelope small: it is read and
+    re-serialised on every mutation and fed back to the model by
+    ``tasks(action='list')``, where an always-present empty string would
+    spend budget on nothing."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="plain")
+    assert "note" not in task
+
+
+def test_tasks_add_stores_note_when_set(tmp_path):
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="ask", note="which backend is canonical?")
+    assert task["note"] == "which backend is canonical?"
+
+
+def test_tasks_add_rejects_note_over_200(tmp_path):
+    """Same reject-don't-truncate rule as the title, for the same reason:
+    the note is the operator-facing ask, which is precisely the string
+    where silent trimming loses what the field exists to carry."""
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title="t", note="a" * 201)
+    assert "error" in result
+    assert "too long" in result["error"]
+    boundary = client.tasks_add("coord-1", title="t2", note="a" * 200)
+    assert "error" not in boundary
+    assert len(boundary["note"]) == 200
+
+
+def test_tasks_update_sets_and_clears_note(tmp_path):
+    """``note`` follows ``child_ws_id``, not ``title``: it is optional, so
+    an empty string is a CLEAR rather than an error."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="ask")
+    updated = client.tasks_update("coord-1", task_id=task["id"], note="need a decision")
+    assert updated["note"] == "need a decision"
+    cleared = client.tasks_update("coord-1", task_id=task["id"], note="")
+    assert "note" not in cleared
+
+
+def test_tasks_update_rejects_note_over_200_and_leaves_task_intact(tmp_path):
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="ask", note="short")
+    result = client.tasks_update("coord-1", task_id=task["id"], note="a" * 201)
+    assert "error" in result
+    envelope = client.tasks_get("coord-1")
+    assert envelope["tasks"][0]["note"] == "short"
+
+
+def test_tasks_note_survives_reorder(tmp_path):
+    client = _task_client(tmp_path)
+    a = client.tasks_add("coord-1", title="a", note="keep me")
+    b = client.tasks_add("coord-1", title="b")
+    client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    envelope = client.tasks_get("coord-1")
+    by_id = {t["id"]: t for t in envelope["tasks"]}
+    assert by_id[a["id"]]["note"] == "keep me"
+
+
+def test_legacy_task_row_without_note_round_trips(tmp_path):
+    """There is no backfill — rows written before the field existed have
+    no ``note`` key, and every reader must tolerate its absence."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="legacy")
+    assert "note" not in task
+    updated = client.tasks_update("coord-1", task_id=task["id"], status="in_progress")
+    assert updated["status"] == "in_progress"
+    assert "note" not in updated

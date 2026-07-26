@@ -48,9 +48,16 @@ export function formatCount(n) {
 // Friendly display label for an operator-context system turn's `_source`.
 // The metacognition nudge types (metacognition._NUDGE_MAP, mirrored in
 // tool_advisory.SYSTEM_TURN_SOURCES) collapse to one "metacognition" category;
-// the other generic-bubble sources are humanized.  Carded kinds (watch_triggered
-// / output_guard / idle_children / user_interjection) render via their own
-// builders and never reach this label.
+// the other generic-bubble sources are humanized.
+//
+// Carded kinds (watch_triggered / output_guard / idle_children / idle_tasks /
+// user_interjection) normally render via their own builders — but every
+// card dispatch is guarded on the turn carrying `meta`, so a replayed turn
+// whose persisted `_source_meta` is absent or unparseable falls through to
+// the plain bubble and DOES reach this label.  Carded kinds therefore still
+// need an entry here, or that fallback leaks the raw `_source`
+// ("operator · idle_children") — the exact regression
+// test_app_js.test_operator_nudge_labels_use_shared_helper guards.
 const OPERATOR_SOURCE_LABELS = {
   correction: "metacognition",
   denial: "metacognition",
@@ -60,6 +67,8 @@ const OPERATOR_SOURCE_LABELS = {
   repeat: "metacognition",
   tool_error: "tool error",
   skill_hint: "skill hint",
+  idle_children: "idle children",
+  idle_tasks: "open tasks",
 };
 export function operatorSourceLabel(source) {
   return OPERATOR_SOURCE_LABELS[source] || source || "operator";

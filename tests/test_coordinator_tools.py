@@ -1213,7 +1213,7 @@ def test_tasks_exec_add_dispatches(coord_session):
     item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "plan", "status": "pending"}))
     _, _ = sess._exec_tasks(item)
     coord.tasks_add.assert_called_once_with(
-        sess._ws_id, title="plan", status="pending", child_ws_id=""
+        sess._ws_id, title="plan", status="pending", child_ws_id="", note=""
     )
 
 
@@ -1649,14 +1649,17 @@ def test_tasks_update_without_title_evaluates_intent_cleanly(coord_session, monk
     assert item["title"] is None
     sess._evaluate_intent([item])
     # title collapses None → "" (truncatable text); status is projected so the
-    # judge can see what state is being set; child_ws_id passes through as None
-    # ("unchanged"), never sliced.
+    # judge can see what state is being set; child_ws_id and note pass through
+    # as None ("unchanged"), never sliced.  note deliberately does NOT follow
+    # title's collapse — an empty note is a legal value (it clears the field),
+    # so None → "" would show the judge a clear nobody requested.
     assert item["func_args"] == {
         "action": "update",
         "task_id": "tsk_1",
         "title": "",
         "status": "in_progress",
         "child_ws_id": None,
+        "note": None,
     }
 
 
@@ -1850,3 +1853,126 @@ def test_notify_exec_on_coord_session_sends_via_channel_gateway(coord_session, t
     assert post_kwargs["json"]["target"] == {"username": "admin"}
     assert post_kwargs["json"]["message"] == "batch failed on child-x"
     assert post_kwargs["json"]["ws_id"] == "coord-1"
+
+
+def test_tasks_prepare_add_rejects_non_string_note(coord_session):
+    """Without the type check, ``note=42`` reaches ``tasks_add`` and blows
+    up inside ``.strip()`` as a generic 'add failed'."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "t", "note": 42}))
+    assert "error" in item
+    assert "note must be a string" in item["error"]
+
+
+def test_tasks_prepare_update_rejects_non_string_note(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1", "note": ["x"]}))
+    assert "error" in item
+    assert "note must be a string" in item["error"]
+
+
+def test_tasks_prepare_update_with_note_alone_is_accepted(coord_session):
+    """A note-only update is exactly the shape the idle-tasks nudge tells
+    the model to make, so it must count toward 'something to update'."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "note": "need a decision"})
+    )
+    assert "error" not in item
+    assert item["note"] == "need a decision"
+
+
+def test_tasks_prepare_update_with_nothing_still_rejected(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1"}))
+    assert "error" in item
+    assert "at least one of" in item["error"]
+
+
+def test_tasks_prepare_add_preview_carries_note(coord_session):
+    """The operator approves the mutation from the preview; a hidden note
+    means approving an ask they cannot read."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "add",
+                "title": "pick a backend",
+                "status": "needs_operator",
+                "note": "which auth backend is canonical?",
+            },
+        )
+    )
+    assert "error" not in item
+    assert "which auth backend is canonical?" in item["preview"]
+
+
+def test_tasks_projection_carries_note_to_judge(coord_session, monkeypatch):
+    """Smart Approvals rules on ``func_args`` alone — an unprojected field
+    is invisible to it."""
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "status": "needs_operator",
+                "note": "need a decision on the schema",
+            },
+        )
+    )
+    sess._evaluate_intent([item])
+    assert item["func_args"]["note"] == "need a decision on the schema"
+
+
+def test_tasks_preview_marks_truncated_note(coord_session):
+    """The operator rules on the preview.  A bare slice reads as the
+    whole argument — and with notes capped at 200 the half they never saw
+    can be the half naming the destructive option."""
+    sess, _coord, _ui = coord_session
+    long_note = "point the migration at " + ("x" * 200)
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "add", "title": "t", "note": long_note[:200]})
+    )
+    assert "error" not in item
+    assert "chars omitted]" in item["preview"], (
+        "an over-budget note must carry honest_truncate's marker, not a silent slice"
+    )
+
+
+def test_tasks_preview_marks_truncated_title(coord_session):
+    """All four preview/header slices in _prepare_tasks use the same
+    honest marker — converting only the note ones would leave the
+    function internally inconsistent."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "t" * 200}))
+    assert "error" not in item
+    assert "chars omitted]" in item["header"]
+
+
+def test_tasks_update_whitespace_note_previews_as_clear(coord_session):
+    """Preview/execute divergence: a whitespace-only note is truthy
+    before the strip, so it previewed as a note being SET while
+    tasks_update stripped it to "" and took the CLEAR branch — the
+    operator approved "set a note" and the tool deleted one."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1", "note": "   "}))
+    assert "error" not in item
+    # Stripped once at prepare, so preview, projection and execute agree.
+    assert item["note"] == ""
+    assert "note=-" in item["preview"]
+
+
+def test_tasks_update_none_note_stays_unchanged(coord_session):
+    """The strip must preserve the None/"" distinction: None means
+    "unchanged", "" means "clear"."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "status": "done"})
+    )
+    assert "error" not in item
+    assert item["note"] is None
+    assert "note=" not in item["preview"]

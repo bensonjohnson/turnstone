@@ -1,6 +1,6 @@
 {
   "name": "tasks",
-  "description": "Ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to decompose work, mark progress, and link tasks to spawned children via `child_ws_id`. Actions: `add` (append), `update` (mutate title/status/child_ws_id by id), `remove` (by id), `reorder` (by id list), `list`. Status: `pending`, `in_progress`, `done`, `blocked`. Titles over 200 chars are rejected (error) rather than silently truncated. `child_ws_id` is a free-form label — not validated against the workstreams table, so it can point at a not-yet-spawned or already-closed id; cross-reference `list_workstreams` if you care.",
+  "description": "Ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to decompose work, mark progress, and link tasks to spawned children via `child_ws_id`. Actions: `add` (append), `update` (mutate title/status/child_ws_id/note by id), `remove` (by id), `reorder` (by id list), `list`. Status: `pending`, `in_progress`, `done`, `blocked`, `needs_operator`. Use `blocked` when something you may be able to clear yourself is in the way (a build, a sibling task, a running child); use `needs_operator` when the task cannot proceed without a decision, approval, or grant that only the operator can give — that is a valid place to stop, and `note` is where you say what you need. Titles and notes over 200 chars are rejected (error) rather than silently truncated. `child_ws_id` is a free-form label — not validated against the workstreams table, so it can point at a not-yet-spawned or already-closed id; cross-reference `list_workstreams` if you care.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -19,8 +19,12 @@
       },
       "status": {
         "type": "string",
-        "description": "For 'add' and 'update': pending / in_progress / done / blocked.",
-        "enum": ["pending", "in_progress", "done", "blocked"]
+        "description": "For 'add' and 'update': pending / in_progress / done / blocked / needs_operator. `blocked` = waiting on a dependency you may be able to clear yourself. `needs_operator` = waiting on a decision, approval, or grant only the operator can give; pair it with `note`.",
+        "enum": ["pending", "in_progress", "done", "blocked", "needs_operator"]
+      },
+      "note": {
+        "type": "string",
+        "description": "For 'add' and 'update': optional one-sentence note. Use it to say what you need from the operator on a `needs_operator` task, so setting the status does not overwrite the title. Max 200 chars; longer notes are REJECTED (not truncated). Pass an empty string on 'update' to clear it."
       },
       "child_ws_id": {
         "type": "string",

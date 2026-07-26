@@ -1053,49 +1053,155 @@ function createCoordinatorPane(root, wsId, opts) {
     return el;
   }
 
+  // Task statuses the pane knows how to render, mapped to the operator-facing
+  // chip text.  Mirrors ``_TASK_STATUS_IS_OPEN`` in coordinator_client.py —
+  // a cross-surface test pins the two key sets together, so a new status
+  // fails CI until this map knows it.  Doubles as the allowlist for the
+  // CSS class: the status string arrives from storage, and a hand-edited
+  // row (`status: "x y"`) would otherwise inject arbitrary classes via
+  // `className`.
+  const TASK_STATUS_LABELS = {
+    pending: "pending",
+    in_progress: "in progress",
+    done: "done",
+    blocked: "blocked",
+    needs_operator: "needs you",
+  };
+
+  function taskStatusKnown(status) {
+    return Object.prototype.hasOwnProperty.call(TASK_STATUS_LABELS, status);
+  }
+
+  // Operator-facing text for a task status.  Both surfaces that show a
+  // status — the tasks sidebar chip and the idle-tasks conversation card
+  // — go through here, so one task can never read `in_progress` in one
+  // place and `in progress` in the other.  Unknown values pass through
+  // verbatim rather than being hidden.
+  function taskStatusLabel(status) {
+    return taskStatusKnown(status) ? TASK_STATUS_LABELS[status] : status;
+  }
+
+  // Shared DOM builder for the two idle cards.  The cards are the same
+  // class of notice ("you went idle with N outstanding") and share their
+  // grouped CSS rules; sharing the builder keeps the DOM shape in
+  // lockstep the same way — an accessibility attribute or scroll change
+  // lands on both or neither.  ``rows`` is ``[{name, state, note?}]``,
+  // all fields pre-sanitized at the producer and rendered via
+  // textContent so hostile values are inert.  ``moreCount`` > 0 appends
+  // the overflow line so a capped list never reads as "that's all".
+  // The wrappers below keep their full className/data-ts-role literals
+  // — the test_coordinator_page pins grep for them.
+  function buildIdleCard(
+    className,
+    tsRole,
+    ariaLabel,
+    headerText,
+    rows,
+    moreCount,
+  ) {
+    const el = document.createElement("div");
+    el.className = className;
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", tsRole);
+    el.setAttribute("aria-label", ariaLabel);
+    const header = document.createElement("div");
+    header.className = "msg-idle-header";
+    header.textContent = headerText;
+    el.appendChild(header);
+    const list = document.createElement("ul");
+    list.className = "msg-idle-list";
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const li = document.createElement("li");
+      li.className = "msg-idle-child";
+      const name = document.createElement("span");
+      name.className = "msg-idle-child-name";
+      name.textContent = String(r.name || "");
+      li.appendChild(name);
+      if (r.state) {
+        const state = document.createElement("span");
+        state.className = "msg-idle-child-state";
+        state.textContent = String(r.state);
+        li.appendChild(state);
+      }
+      if (r.note) {
+        const note = document.createElement("div");
+        note.className = "msg-idle-note";
+        note.textContent = String(r.note);
+        li.appendChild(note);
+      }
+      list.appendChild(li);
+    }
+    el.appendChild(list);
+    if (moreCount > 0) {
+      const more = document.createElement("div");
+      more.className = "msg-idle-more";
+      more.textContent = "…and " + moreCount + " more";
+      el.appendChild(more);
+    }
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
   // Structured ``.msg.idle-children`` card for the coordinator-only
   // ``idle_children`` operator-context system turn — lists the child
   // workstreams still running while the coordinator went idle.  ``meta.children``
   // is ``[{ws_id, name, state}]`` (names already ``sanitize_name``-cleaned at the
-  // producer); rendered via textContent so a hostile workstream name is inert.
+  // producer).  Workstream states render RAW, unlike the tasks card's
+  // status labels: running/thinking/attention are already plain
+  // lowercase words, while task statuses carry machine underscores
+  // (``in_progress``) that need the label map.  One vocabulary per
+  // surface-kind, not one rule for both cards.
   function appendIdleChildren(meta) {
-    const el = document.createElement("div");
-    el.className = "msg idle-children operator-context";
-    el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "idle_children");
-    el.setAttribute("aria-label", "idle children");
     const children = Array.isArray(meta.children) ? meta.children : [];
-    const header = document.createElement("div");
-    header.className = "msg-idle-header";
-    header.textContent =
+    const rows = children.map((c) => ({
+      name: (c && (c.name || c.ws_id)) || "child",
+      state: c && c.state ? String(c.state) : "",
+    }));
+    const headerText =
       "idle · " +
       children.length +
       (children.length === 1
         ? " child still running"
         : " children still running");
-    el.appendChild(header);
-    const list = document.createElement("ul");
-    list.className = "msg-idle-list";
-    for (let i = 0; i < children.length; i++) {
-      const c = children[i] || {};
-      const li = document.createElement("li");
-      li.className = "msg-idle-child";
-      const name = document.createElement("span");
-      name.className = "msg-idle-child-name";
-      name.textContent = String(c.name || c.ws_id || "child");
-      li.appendChild(name);
-      if (c.state) {
-        const state = document.createElement("span");
-        state.className = "msg-idle-child-state";
-        state.textContent = String(c.state);
-        li.appendChild(state);
-      }
-      list.appendChild(li);
-    }
-    el.appendChild(list);
-    messagesEl.appendChild(el);
-    _scheduleScroll();
-    return el;
+    return buildIdleCard(
+      "msg idle-children operator-context",
+      "idle_children",
+      "idle children",
+      headerText,
+      rows,
+      0,
+    );
+  }
+
+  // Structured ``.msg.idle-tasks`` card for the coordinator-only
+  // ``idle_tasks`` operator-context system turn — lists the open tasks the
+  // coordinator still holds after going idle with no active children.
+  // ``meta.tasks`` is ``[{id, title, status, note}]`` capped at the producer's
+  // display cap, with ``meta.total`` the uncapped count; ``title``/``note`` are
+  // already ``sanitize_name``-cleaned at the producer.  Statuses map
+  // through the same ``taskStatusLabel`` helper as the tasks pane so the
+  // conversation card and the sidebar never show two names for one
+  // state.
+  function appendIdleTasks(meta) {
+    const tasks = Array.isArray(meta.tasks) ? meta.tasks : [];
+    const total = typeof meta.total === "number" ? meta.total : tasks.length;
+    const rows = tasks.map((t) => ({
+      name: (t && (t.title || t.id)) || "task",
+      state: t && t.status ? taskStatusLabel(String(t.status)) : "",
+      note: t && t.note ? String(t.note) : "",
+    }));
+    const headerText =
+      "idle · " + total + (total === 1 ? " open task" : " open tasks");
+    return buildIdleCard(
+      "msg idle-tasks operator-context",
+      "idle_tasks",
+      "open tasks",
+      headerText,
+      rows,
+      Math.max(0, total - tasks.length),
+    );
   }
 
   // "queued message" bubble for a ``user_interjection`` system turn — shows the
@@ -1116,9 +1222,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // Dispatch a first-class operator-context system turn to the right renderer.
   // Shared by the live ``system_turn`` SSE handler and history replay so the
   // two can't drift on which kinds get structured cards.  ``watch_triggered`` /
-  // ``output_guard`` / ``idle_children`` carry structured ``meta`` → cards;
-  // ``user_interjection`` → a "queued message" bubble; everything else → the
-  // labeled operator bubble.
+  // ``output_guard`` / ``idle_children`` / ``idle_tasks`` carry structured
+  // ``meta`` → cards; ``user_interjection`` → a "queued message" bubble;
+  // everything else → the labeled operator bubble.
   function renderSystemTurn(source, content, meta) {
     const m = meta && typeof meta === "object" ? meta : null;
     // /history projection of a persisted compaction marker — same result
@@ -1133,6 +1239,7 @@ function createCoordinatorPane(root, wsId, opts) {
       return appendWatchResult(m, content || "");
     if (source === "output_guard" && m) return appendGuardFinding(m);
     if (source === "idle_children" && m) return appendIdleChildren(m);
+    if (source === "idle_tasks" && m) return appendIdleTasks(m);
     if (source === "user_interjection")
       return appendInterjection(m, content || "");
     return appendText("system", content || "", {
@@ -4908,9 +5015,14 @@ function createCoordinatorPane(root, wsId, opts) {
     row.className = "task-row";
     row.setAttribute("role", "listitem");
     const status = task.status || "pending";
+    // Unknown values keep the neutral base chip rather than styling
+    // themselves — the allowlist is what stops a hand-edited status
+    // from injecting classes through `className`.
     const statusSpan = document.createElement("span");
-    statusSpan.className = "status status-" + status;
-    statusSpan.textContent = status;
+    statusSpan.className = taskStatusKnown(status)
+      ? "status status-" + status
+      : "status";
+    statusSpan.textContent = taskStatusLabel(status);
     const title = document.createElement("span");
     title.className = "title";
     title.textContent = task.title || "";
@@ -4918,6 +5030,12 @@ function createCoordinatorPane(root, wsId, opts) {
     head.appendChild(statusSpan);
     head.appendChild(title);
     row.appendChild(head);
+    if (task.note) {
+      const noteEl = document.createElement("div");
+      noteEl.className = "meta note";
+      noteEl.textContent = task.note;
+      row.appendChild(noteEl);
+    }
     if (task.child_ws_id && WS_ID_RE.test(task.child_ws_id)) {
       const link = document.createElement("div");
       link.className = "meta";

@@ -114,9 +114,9 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
-    MEMORY_NUDGE_TYPES,
     NUDGE_COMPACTION_RESUME,
     NUDGE_COMPACTION_RESUME_NO_RECALL,
+    NUDGE_REQUIRED_TOOL,
     RepeatDetector,
     detect_completion,
     detect_correction,
@@ -861,6 +861,16 @@ _LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
 # unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
+
+# Per-field character budget for the tasks approval preview/header.  The
+# operator rules on the preview, so over-budget fields are cut with
+# ``honest_truncate``'s explicit marker, never a bare slice — a bare
+# ``[:60]`` reads as the whole argument, and with ``_TASK_NOTE_MAX`` /
+# ``_TASK_TITLE_MAX`` at 200 the half the operator never saw can be the
+# half naming the destructive option.  NOT ``judge.arg_budget_chars()``:
+# that is the judge-context budget (thousands of chars), which would make
+# the preview slice a no-op.
+_TASK_PREVIEW_FIELD_CHARS = 60
 
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
@@ -3938,18 +3948,26 @@ class ChatSession:
             self._watch_runner.remove_dispatch_fn(old_ws_id, owner=old_fn)
 
     def _nudges_enabled(self, nudge_type: str) -> bool:
-        """Config gate + persona lever 4 for metacognitive nudges.
+        """Config gate + required-tool visibility for ADVICE nudges.
 
-        Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
-        whenever the persona's envelope hides the memory tool — the lever
-        being off OR an allowlist that hides ``memory`` (a tool_search
-        expansion that re-adds it re-enables them) — because their copy
-        directs the model at that tool.  Every other nudge type passes
-        straight through to the config gate.
+        Tool-directed nudge types (``NUDGE_REQUIRED_TOOL`` — the memory
+        set plus ``idle_tasks``) are suppressed whenever the persona's
+        envelope hides the tool their copy names: the memory lever being
+        off OR an allowlist that hides the tool (a tool_search expansion
+        that re-adds it re-enables them).  A nudge instructing the model
+        at a tool it cannot see produces "I don't have access" apology
+        loops.  Types with no required tool pass straight through to the
+        config gate.
+
+        LIVENESS nudges never reach this method: ``idle_children`` (the
+        coordinator wake for active children) is deliberately not gated
+        on ``memory.nudges`` — see the classification ruling in
+        :mod:`turnstone.console.coordinator_idle_observer`.
         """
         if not self._mem_cfg.nudges:
             return False
-        return nudge_type not in MEMORY_NUDGE_TYPES or self._persona_tool_visible("memory")
+        required = NUDGE_REQUIRED_TOOL.get(nudge_type)
+        return required is None or self._persona_tool_visible(required)
 
     def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
@@ -8952,6 +8970,22 @@ class ChatSession:
                         fa_tasks["status"] = it.get("status")
                     if "child_ws_id" in it:
                         fa_tasks["child_ws_id"] = it.get("child_ws_id")
+                    if "note" in it:
+                        # Free text the model authored — the judge must see
+                        # it or it rules on a mutation whose payload is
+                        # hidden from it.  Follows ``child_ws_id``, NOT
+                        # ``title``: a ``None`` passes through as-is so it
+                        # honestly reads as "unchanged", because unlike a
+                        # title an empty note is a legal value (it clears
+                        # the field).  Collapsing ``None`` to ``""`` here
+                        # would show the judge a clear that was never
+                        # requested.  Truncate only an actual string.
+                        note_val = it.get("note")
+                        fa_tasks["note"] = (
+                            honest_truncate(note_val, arg_budget)
+                            if isinstance(note_val, str)
+                            else note_val
+                        )
                 it["func_args"] = fa_tasks
             elif name == "read_resource":
                 # Gated MCP resource read.  The URI is the risk surface
@@ -14128,7 +14162,7 @@ class ChatSession:
             # Reject non-string title / status / child_ws_id up front so
             # a malformed model call (``title=42``) produces a clean tool
             # error rather than an AttributeError during ``.strip()``.
-            for field_name in ("title", "status", "child_ws_id"):
+            for field_name in ("title", "status", "child_ws_id", "note"):
                 raw = args.get(field_name)
                 if raw is not None and not isinstance(raw, str):
                     return self._coord_tool_error(
@@ -14139,11 +14173,26 @@ class ChatSession:
                 return self._coord_tool_error(call_id, "tasks", "add: title is required")
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
-            item["header"] = f"\u2699 tasks add: {title[:60]}"
-            item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
+            note = self._coord_str_arg(args, "note").strip()
+            # Local import mirroring ``_project_func_args``' own sites —
+            # a module-level ``judge`` import is a cycle.
+            from turnstone.core.judge import honest_truncate
+
+            item["header"] = (
+                f"\u2699 tasks add: {honest_truncate(title, _TASK_PREVIEW_FIELD_CHARS)}"
+            )
+            # The note rides the preview because it is the operator-facing
+            # payload of the mutation — approving a ``needs_operator`` task
+            # without seeing what the coordinator is asking for defeats the
+            # point of the approval.
+            add_bits = [f"status={status}", f"child_ws_id={child_ws_id or '-'}"]
+            if note:
+                add_bits.append(f"note={honest_truncate(note, _TASK_PREVIEW_FIELD_CHARS)}")
+            item["preview"] = " ".join(add_bits)
             item["title"] = title
             item["status"] = status
             item["child_ws_id"] = child_ws_id
+            item["note"] = note
         elif action == "update":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
@@ -14158,10 +14207,12 @@ class ChatSession:
             upd_title: Any = args.get("title")
             upd_status: Any = args.get("status")
             upd_child: Any = args.get("child_ws_id")
+            upd_note: Any = args.get("note")
             for field_name, field_val in (
                 ("title", upd_title),
                 ("status", upd_status),
                 ("child_ws_id", upd_child),
+                ("note", upd_note),
             ):
                 if field_val is not None and not isinstance(field_val, str):
                     return self._coord_tool_error(
@@ -14169,25 +14220,48 @@ class ChatSession:
                         "tasks",
                         f"update: {field_name} must be a string",
                     )
-            if upd_title is None and upd_status is None and upd_child is None:
+            # ``note`` counts toward "something to update" — a note-only
+            # update (recording what the coordinator needs from the
+            # operator without touching status) is a legitimate call, and
+            # omitting it here would reject the exact shape the idle-tasks
+            # nudge tells the model to make.
+            if upd_title is None and upd_status is None and upd_child is None and upd_note is None:
                 return self._coord_tool_error(
                     call_id,
                     "tasks",
-                    "update: at least one of title / status / child_ws_id is required",
+                    "update: at least one of title / status / child_ws_id / note is required",
                 )
+            # Strip the note ONCE, here, so the preview, the judge
+            # projection, and ``tasks_update`` all see the same value.  A
+            # whitespace-only note otherwise previews as a note being SET
+            # (truthy before the strip) while execute strips it to ``""``
+            # and takes the CLEAR branch — the operator approves "set a
+            # note" and the tool deletes one.  The strip must preserve
+            # ``None`` ("unchanged"): only a present string is stripped,
+            # and ``""`` (clear) stays distinct from ``None`` throughout.
+            if isinstance(upd_note, str):
+                upd_note = upd_note.strip()
+            from turnstone.core.judge import honest_truncate
+
             item["header"] = f"\u2699 tasks update: {task_id}"
             bits: list[str] = []
             if upd_title is not None:
-                bits.append(f"title={upd_title[:60]}")
+                bits.append(f"title={honest_truncate(upd_title, _TASK_PREVIEW_FIELD_CHARS)}")
             if upd_status is not None:
                 bits.append(f"status={upd_status}")
             if upd_child is not None:
                 bits.append(f"child_ws_id={upd_child or '-'}")
+            if upd_note is not None:
+                # ``or '-'`` renders an explicit clear (``""``) the same
+                # way ``child_ws_id`` renders one, so the operator sees
+                # "note=-" rather than an empty tail.
+                bits.append(f"note={honest_truncate(upd_note, _TASK_PREVIEW_FIELD_CHARS) or '-'}")
             item["preview"] = " ".join(bits)
             item["task_id"] = task_id
             item["title"] = upd_title
             item["status"] = upd_status
             item["child_ws_id"] = upd_child
+            item["note"] = upd_note
         elif action == "remove":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
@@ -14222,6 +14296,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "update":
                 result = self._coord_client.tasks_update(
@@ -14230,6 +14305,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "remove":
                 result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])
