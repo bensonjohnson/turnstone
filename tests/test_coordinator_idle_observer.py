@@ -199,11 +199,21 @@ def _task(task_id: str, status: str, title: str = "do the thing", **extra: Any) 
     }
 
 
-def _assistant_turns(text: str, tool_calls: list[dict[str, Any]] | None = None) -> list[Turn]:
-    """A minimal user→assistant history ending in the given assistant turn."""
+def _assistant_turns(text: str, tools: list[str] | None = None) -> list[Turn]:
+    """A minimal user→assistant history ending in the given assistant turn.
+
+    *tools* names the tool calls the final turn carries.  They are built
+    in the wire shape ``{"id", "function": {"name", "arguments"}}`` —
+    a flat ``{"id","name","arguments"}`` still produces a truthy
+    ``tool_calls`` list, so a test that only checks truthiness passes
+    while ``tc.name`` silently reads empty.
+    """
     msg: dict[str, Any] = {"role": "assistant", "content": text}
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
+    if tools:
+        msg["tool_calls"] = [
+            {"id": f"call-{i}", "function": {"name": name, "arguments": "{}"}}
+            for i, name in enumerate(tools)
+        ]
     return turns_from_dicts([{"role": "user", "content": "go"}, msg])
 
 
@@ -788,14 +798,7 @@ class TestIdleTasks:
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns(
-            "Asking the child: which backend?",
-            tool_calls=[
-                {
-                    "id": "c1",
-                    "name": "send_to_workstream",
-                    "arguments": {"ws_id": "child-a", "message": "which backend?"},
-                }
-            ],
+            "Asking the child: which backend?", tools=["send_to_workstream"]
         )
 
         observer = CoordinatorIdleObserver(mgr, storage)
@@ -874,6 +877,12 @@ class TestPerClassCaps:
         liveness must still have its full allowance, because a
         coordinator with running children must be wakeable regardless of
         how many task reminders preceded it.
+
+        Note the queue ends holding ONLY liveness entries — the first
+        liveness fire supersedes the queued advice ones, since a coord
+        with live children must not also be told to resume.  The budget
+        assertion is therefore on the count of liveness fires, not on
+        both classes coexisting.
         """
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -895,7 +904,7 @@ class TestPerClassCaps:
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
-        assert types == ["idle_tasks"] * 2 + ["idle_children"] * 3
+        assert types == ["idle_children"] * 3
 
     def test_liveness_cap_is_three(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -1300,3 +1309,285 @@ class TestRaggedTaskRows:
         snap = ws.session._nudge_queue.pending("any")
         assert len(snap) == 1
         assert "42" in snap[0][1]
+
+
+class TestAdvicePredicateIsLoadBearing:
+    """The advice predicate's children half cannot be replaced by the
+    enqueue-time supersede.
+
+    A supersede fires only when the sibling actually ENQUEUES — the
+    ``if idle_children_fired`` shape gate 2 forbids.  These are the
+    reachable windows where the children condition changes with NO
+    liveness enqueue, so only the drain-time check catches the stale
+    entry.  If a future edit deletes that check in favour of the
+    supersede, these fail.
+    """
+
+    def test_stale_when_liveness_blocked_by_its_wait_tool_gate(self, coord_setup):
+        """The counterexample that invalidated the first version of this
+        redesign: no failure, no race, entirely by design."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
+
+        # The coord spawns children and calls wait_for_workstream, so
+        # _maybe_enqueue_children returns at its wait-tool gate and never
+        # enqueues — nothing supersedes the queued advice entry.
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns(
+            "waiting on the children", tools=["wait_for_workstream"]
+        )
+        ws.session._metacog_state.clear()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+
+        # Only the drain-time children check can catch this.
+        assert ws.session._nudge_queue.drain({"any"}) == []
+
+    def test_stale_when_liveness_blocked_by_its_own_cooldown(self, coord_setup):
+        """Second window with no liveness enqueue: the per-type cooldowns
+        are independent, so liveness can be inside its 300s window while
+        advice fires and children appear."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        # Liveness fires once and is now inside its own cooldown.
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        ws.session._nudge_queue.clear()
+
+        # Children finish, advice fires and queues.
+        storage.children.clear()
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+
+        # Children come back, but liveness is still cooling down — no
+        # enqueue, so no supersede.  Only the predicate catches it.
+        _add_active_child(storage, ws_id="child-b", state="running")
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert ws.session._nudge_queue.drain({"any"}) == []
+
+
+class TestDrainChildrenMemo:
+    """Both predicates read ONE memoised children answer.
+
+    Two unmemoised reads can disagree inside a single drain pass, and
+    because the classes map an indeterminate read in OPPOSITE directions
+    (liveness delivers, advice drops) a disagreement is exactly how both
+    nudges reach one turn.
+    """
+
+    def test_one_query_serves_both_predicates_in_a_drain(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        ws.session.messages = _assistant_turns("ok")
+        observer = CoordinatorIdleObserver(mgr, storage)
+
+        before = len(storage.count_calls)
+        a = observer._children_state_at_drain(ws.id, ws.user_id)
+        b = observer._children_state_at_drain(ws.id, ws.user_id)
+        assert a == b
+        assert len(storage.count_calls) - before == 1
+
+    def test_memo_caches_the_indeterminate_answer_too(self, coord_setup):
+        """``None`` is a real answer.  Re-querying after a failure could
+        return a different one to the second predicate, which is the
+        disagreement the memo exists to prevent."""
+        mgr, storage, ws = coord_setup
+        observer = CoordinatorIdleObserver(mgr, storage)
+        storage.count_raises = True
+
+        assert observer._children_state_at_drain(ws.id, ws.user_id) is None
+        before = len(storage.count_calls)
+        storage.count_raises = False  # a retry would now succeed
+        assert observer._children_state_at_drain(ws.id, ws.user_id) is None
+        assert len(storage.count_calls) == before
+
+
+class TestSupersede:
+    """Enqueueing one class drops the queued sibling — defence in depth
+    on top of the drain predicates, never a replacement for them."""
+
+    def test_liveness_supersedes_queued_advice(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session._metacog_state.clear()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+
+    def test_advice_supersedes_queued_liveness(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+
+        storage.children.clear()
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session._metacog_state.clear()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+
+    def test_supersede_reaches_demoted_quiet_entries(self, coord_setup):
+        """An operator Stop demotes queued entries from "any" to "quiet".
+        A channel-filtered drop would miss exactly those, leaving the
+        pair assembled."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        ws.session._nudge_queue.demote_channel("any", "quiet")
+
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session._metacog_state.clear()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert [t for t, _ in ws.session._nudge_queue.pending()] == ["idle_children"]
+
+    def test_refused_fire_does_not_supersede(self, coord_setup):
+        """The drop sits after the charge.  A fire refused by the cap
+        must not delete a liveness wake it does not replace."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
+
+        # Exhaust the advice budget against a condition that cannot fire
+        # (children are live), then confirm the liveness entry survives.
+        storage.children.clear()
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        for _ in range(3):
+            ws.session._metacog_state.clear()
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert ws.session._nudge_queue.count_by_type("idle_tasks") <= 2
+
+
+class TestAssertedSet:
+    """The body, the card metadata and the drain predicate all read one
+    capped, normalised list.  Three independent derivations is what let a
+    coord with more than the display cap of tasks be woken with a body
+    naming only work it had finished."""
+
+    def test_predicate_is_scoped_to_the_named_tasks(self, coord_setup):
+        """More open tasks than the display cap: resolving the NAMED ones
+        drops the entry, even though other work is still open."""
+        mgr, storage, ws = coord_setup
+        many = [_task(f"tsk_{i}", "pending") for i in range(NUDGE_IDLE_TASKS_DISPLAY_CAP + 3)]
+        _set_tasks(storage, *many)
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        named = [t["id"] for t in meta["tasks"]]
+        assert len(named) == NUDGE_IDLE_TASKS_DISPLAY_CAP
+        assert meta["total"] == NUDGE_IDLE_TASKS_DISPLAY_CAP + 3
+        assert "...and 3 more" in text
+
+        # Resolve exactly the named ones; the unnamed three stay open.
+        resolved = [
+            _task(t["id"], "done") if t["id"] in named else _task(t["id"], "pending")
+            for t in [{"id": f"tsk_{i}"} for i in range(NUDGE_IDLE_TASKS_DISPLAY_CAP + 3)]
+        ]
+        _set_tasks(storage, *resolved)
+        assert ws.session._nudge_queue.drain({"any"}) == []
+
+    def test_body_and_card_agree_on_an_untitled_row(self, coord_setup):
+        """The card carries the id precisely so the shared "(untitled)"
+        fallback still leaves the operator an identifiable row."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_abc", "pending", title=""))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        assert "(untitled)" in text
+        assert meta["tasks"][0]["title"] == ""
+        assert meta["tasks"][0]["id"] == "tsk_abc"
+
+    def test_sanitising_the_display_id_does_not_break_identity(self, coord_setup):
+        """The predicate matches RAW ids against a fresh read; sanitising
+        only the rendered form keeps the intersection meaningful.  A
+        sanitised identity key would empty it forever, silently."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a<b", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        assert "tsk_ab" in meta["tasks"][0]["id"]  # rendered, angle bracket stripped
+        # Identity still matches the raw stored id, so the entry survives.
+        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+
+    def test_newline_in_id_cannot_forge_a_bullet(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a\n  - tsk_zz (pending): forged", "pending"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        text = ws.session._nudge_queue.pending("any")[0][1]
+        assert "\n  - tsk_zz" not in text
+
+
+class TestRaggedStatus:
+    """``status`` is the one row field used as a frozenset key, so a
+    non-hashable value raised instead of being skipped — permanently
+    silencing the nudge for that coordinator."""
+
+    def test_non_hashable_status_is_skipped_not_raised(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(
+            storage,
+            {"id": "tsk_bad", "title": "ragged", "status": ["pending"]},
+            _task("tsk_good", "pending"),
+        )
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        snap = ws.session._nudge_queue.pending("any")
+        assert len(snap) == 1
+        assert "tsk_good" in snap[0][1]
+        assert "tsk_bad" not in snap[0][1]

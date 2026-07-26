@@ -418,45 +418,53 @@ def _field_str(value: object) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def format_idle_tasks_nudge(tasks: list[dict[str, str]]) -> str:
+def format_idle_tasks_nudge(shown: list[dict[str, str]], *, total: int) -> str:
     """Render the ``idle_tasks`` reminder body.
 
-    *tasks* is a list of the coordinator's open task records — the dict
-    shape :func:`turnstone.console.coordinator_client.load_task_envelope`
-    decodes, of which ``id``, ``title``, ``status`` and the optional
-    ``note`` are read here.  Callers pass only the tasks that should
-    trigger a nudge (``pending`` / ``in_progress``); this function does
-    no status filtering of its own.
+    *shown* is the ALREADY-CAPPED list of rows this nudge asserts, and
+    *total* is how many open tasks exist in all — the overflow line is
+    ``total - len(shown)``.  This function does **not** slice: the
+    producer owns the cap so that the body, the operator card's metadata
+    and the drain-time validity predicate all describe one set.  Three
+    independent slices of "what this nudge is about" is what once let the
+    body render six tasks while the predicate guarded a different number,
+    waking a coordinator with a body naming work it had finished.
+
+    *total* is keyword-only and required so a caller cannot silently lose
+    the overflow line by forgetting it.
+
+    Each row supplies ``id_display`` (or ``id``), ``title``, ``status``
+    and an optional ``note``.  Callers pass only rows whose status should
+    trigger a nudge; this function does no status filtering of its own.
 
     Returns raw text *without* any envelope, matching
     :func:`format_idle_children_nudge` — the nudge is emitted as a
     first-class ``{"role": "system"}`` turn whose content is this text.
 
-    Sanitisation is **this function's** job, not storage's: ``title`` and
-    ``note`` are stored raw (no sanitiser on the ``tasks`` tool write
-    path) and are only safe at their other terminus because the console
-    renders them via ``textContent``.  Both go through
-    :func:`sanitize_name` here so a title containing ``\\n`` cannot forge
-    a fake sibling bullet and one containing ``</thinking>`` cannot steer
-    the model's reasoning channels.  A future producer must not assume
-    stored task fields arrive clean.
+    **Not symmetric with** :func:`format_idle_children_nudge`, which
+    still caps internally: that one needs the uncapped list anyway for
+    its ``wait_for_workstream`` id suggestion, so moving its cap out
+    would buy nothing and cost it a second parameter.
 
-    Display caps at :data:`NUDGE_IDLE_TASKS_DISPLAY_CAP` with an
-    overflow line.  Empty input returns the empty string so callers can
-    short-circuit on ``if not text: return``.
+    Sanitisation is applied here as well as at the ``tasks`` write path.
+    That is deliberate belt-and-braces, not redundancy: rows written
+    before write-path sanitisation existed are still in storage, and this
+    is a public function whose direct callers may pass raw envelope rows.
+    Every interpolated field goes through :func:`sanitize_name` —
+    including the id, since it shares the bullet line and an embedded
+    ``\\n`` there forges a sibling row exactly as one in the title would.
+
+    Empty input returns the empty string so callers can short-circuit on
+    ``if not text: return``.
     """
-    if not tasks:
+    if not shown:
         return ""
     lines = [NUDGE_IDLE_TASKS_HEADER, ""]
-    shown = tasks[:NUDGE_IDLE_TASKS_DISPLAY_CAP]
     for t in shown:
-        # ``_field_str`` before ``sanitize_name``: the observer's
-        # ``_open_tasks`` normalises rows in production, but this is a
-        # public function whose direct callers may pass raw envelope
-        # rows, and ``sanitize_name`` raises ``TypeError`` on a
-        # non-``str``.  Belt-and-braces here closes the class for every
-        # caller permanently.
-        task_id = _field_str(t.get("id"))
+        # ``_field_str`` before ``sanitize_name``: the observer normalises
+        # rows in production, but a direct caller may pass raw envelope
+        # rows and ``sanitize_name`` raises ``TypeError`` on a non-``str``.
+        task_id = sanitize_name(_field_str(t.get("id_display") or t.get("id")))
         title = sanitize_name(_field_str(t.get("title"))) or "(untitled)"
         status = _field_str(t.get("status")) or "?"
         line = f"  - {task_id} ({status}): {title}"
@@ -464,7 +472,7 @@ def format_idle_tasks_nudge(tasks: list[dict[str, str]]) -> str:
         if note:
             line += f" [note: {note}]"
         lines.append(line)
-    overflow = len(tasks) - len(shown)
+    overflow = total - len(shown)
     if overflow > 0:
         lines.append(f"  ...and {overflow} more")
     return "\n".join(lines)

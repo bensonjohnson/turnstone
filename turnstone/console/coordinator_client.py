@@ -38,6 +38,7 @@ import httpx
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
+from turnstone.core.metacognition import sanitize_name
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -228,6 +229,30 @@ _TASK_TITLE_MAX = 200
 # the information the field exists to carry.  One number rather than two
 # so the schema has one sentence to explain.
 _TASK_NOTE_MAX = 200
+
+
+def _clean_task_text(value: str | None) -> str:
+    """Strip + sanitise a model-authored task text field.
+
+    ``title`` and ``note`` are read by four surfaces, and two of them —
+    the tasks sidebar and the tool-approval preview — are what the
+    OPERATOR acts on.  Sanitising only at the nudge formatter (the
+    round-1 rule) left those two receiving raw bytes, so a note carrying
+    a bidi override could render to the operator in an order opposite to
+    what it stored.  Storage is the chokepoint every stored reader
+    shares, so the strip happens here.
+
+    Callers MUST measure length BEFORE calling this and re-test
+    emptiness AFTER: sanitising can empty a value that passed its own
+    guard (``sanitize_name("<>") == ""``), and measuring after would
+    report a length the model never sent, breaking the
+    reject-don't-truncate contract ``_TASK_TITLE_MAX`` documents.
+
+    Note the pre-approval preview path does NOT come through here — it
+    reads the raw tool args before any write — so ``_prepare_tasks``
+    sanitises its own preview strings separately.
+    """
+    return sanitize_name((value or "").strip())
 
 
 def _too_long_error(field: str, length: int, cap: int) -> dict[str, Any]:
@@ -1701,14 +1726,20 @@ class CoordinatorClient:
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
-        clean_title = (title or "").strip()
+        # Order is load-bearing: strip → LENGTH CHECK → sanitise →
+        # re-test emptiness.  See :func:`_clean_task_text`.  Measuring
+        # length before sanitising keeps reject-don't-truncate honest
+        # (the model is told about the value it SENT); re-testing
+        # emptiness after keeps a field that sanitises away from
+        # slipping past a guard it already passed.
+        if len((title or "").strip()) > _TASK_TITLE_MAX:
+            return _too_long_error("title", len((title or "").strip()), _TASK_TITLE_MAX)
+        if len((note or "").strip()) > _TASK_NOTE_MAX:
+            return _too_long_error("note", len((note or "").strip()), _TASK_NOTE_MAX)
+        clean_title = _clean_task_text(title)
         if not clean_title:
             return {"error": "title is required"}
-        clean_note = (note or "").strip()
-        if len(clean_note) > _TASK_NOTE_MAX:
-            return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
-        if len(clean_title) > _TASK_TITLE_MAX:
-            return _too_long_error("title", len(clean_title), _TASK_TITLE_MAX)
+        clean_note = _clean_task_text(note)
         if status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
@@ -1769,11 +1800,15 @@ class CoordinatorClient:
             return {"error": f"tasks scope violation: {ws_id}"}
         if status is not None and status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
+        # Length on the pre-sanitisation value, sanitise after — see
+        # :func:`_clean_task_text`.  A note that sanitises away to ``""``
+        # becomes a CLEAR, which is the same outcome the model asked for
+        # by sending only strippable characters.
         clean_note: str | None = None
         if note is not None:
-            clean_note = note.strip()
-            if len(clean_note) > _TASK_NOTE_MAX:
-                return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
+            if len(note.strip()) > _TASK_NOTE_MAX:
+                return _too_long_error("note", len(note.strip()), _TASK_NOTE_MAX)
+            clean_note = _clean_task_text(note)
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
@@ -1781,11 +1816,15 @@ class CoordinatorClient:
             for t in envelope["tasks"]:
                 if t.get("id") == task_id:
                     if title is not None:
-                        clean = title.strip()
+                        if len(title.strip()) > _TASK_TITLE_MAX:
+                            return _too_long_error("title", len(title.strip()), _TASK_TITLE_MAX)
+                        clean = _clean_task_text(title)
+                        # Re-tested AFTER sanitising: a title of only
+                        # angle brackets or control chars strips to "",
+                        # and storing that would slip an empty title past
+                        # the guard that exists to forbid one.
                         if not clean:
                             return {"error": "title cannot be empty"}
-                        if len(clean) > _TASK_TITLE_MAX:
-                            return _too_long_error("title", len(clean), _TASK_TITLE_MAX)
                         t["title"] = clean
                     if status is not None:
                         t["status"] = status

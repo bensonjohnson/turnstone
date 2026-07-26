@@ -794,9 +794,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory",
             help="When enabled, the system periodically reminds the AI to save important "
             "information from conversations into long-term memory. This helps the AI "
-            "remember context across separate conversations. Does not affect coordinator "
-            "liveness wakes (the 'children still running' nudge), which fire regardless "
-            "so an idle coordinator is never silently stranded.",
+            "remember context across separate conversations. Also gates the coordinator's "
+            "open-task reminder. Does not affect coordinator liveness wakes (the 'children "
+            "still running' nudge), which fire regardless so an idle coordinator is never "
+            "silently stranded.",
         ),
         # -- tls ----------------------------------------------------------------
         SettingDef(

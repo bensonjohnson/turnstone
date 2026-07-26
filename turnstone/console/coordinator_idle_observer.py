@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from turnstone.console.coordinator_client import TASK_OPEN_STATUSES, load_task_envelope
@@ -129,6 +130,19 @@ _NUDGE_TYPE_CAPS: dict[str, int] = {
     "idle_tasks": 2,
 }
 
+# The other class's nudge type.  The two conditions are mutually
+# exclusive, so a queued sibling is stale the moment this class fires,
+# and shipping both in one drain hands the model contradictory
+# instructions.  Superseding at enqueue is DEFENCE IN DEPTH ONLY — the
+# authoritative guard is each drain predicate's own condition check,
+# because a supersede fires only when this class actually enqueues and
+# there are reachable windows where the sibling's condition changes with
+# no enqueue at all (the wait-tool gate, its cooldown, its cap).
+_SIBLING_NUDGE_TYPE: dict[str, str] = {
+    "idle_children": "idle_tasks",
+    "idle_tasks": "idle_children",
+}
+
 # Soft cap on the snapshot query.  Higher than ``WAIT_MAX_WS_IDS`` so
 # the SQL ``LIMIT`` (applied before the Python state filter) doesn't
 # clip genuinely-active children whose ``updated`` timestamp is older
@@ -136,6 +150,23 @@ _NUDGE_TYPE_CAPS: dict[str, int] = {
 # smaller than this; if a coord ever exceeds it, the formatter still
 # truncates to ``WAIT_MAX_WS_IDS`` for the model-facing suggestion.
 _ACTIVE_CHILDREN_QUERY_LIMIT = 200
+
+# TTL (seconds) on the drain-time children answer.
+#
+# BOTH drain predicates read the children state through one memoised
+# call, and this is why.  ``NudgeQueue.drain_entries`` evaluates each
+# entry's ``valid_until`` independently, so two unmemoised reads
+# microseconds apart can disagree — the liveness read raising (→ deliver,
+# fail-open) while the advice read succeeds and sees no children (→
+# deliver) puts BOTH nudges in one turn, which is the contradictory pair
+# this module exists to prevent.  Memoising makes the two predicates
+# answer from the same observation, so their deliberately-opposite
+# failure directions stay consistent instead of combining.
+#
+# One second is long enough to span a single ``drain_entries`` loop (both
+# predicates run on the same thread, back to back) and short enough that
+# no entry is judged on a meaningfully stale view.
+_DRAIN_CHILDREN_TTL_SECONDS = 1.0
 
 
 class CoordinatorIdleObserver:
@@ -159,6 +190,12 @@ class CoordinatorIdleObserver:
         # the contract robust).
         self._fire_counts: dict[str, dict[str, int]] = {}
         self._fire_counts_lock = threading.Lock()
+        # Drain-time children answers, ``ws_id -> (monotonic_stamp, answer)``.
+        # Shared by both classes' predicates so they cannot disagree — see
+        # :data:`_DRAIN_CHILDREN_TTL_SECONDS`.  Pruned on write, so it holds
+        # at most the coords drained within the last TTL.
+        self._drain_children: dict[str, tuple[float, bool | None]] = {}
+        self._drain_children_lock = threading.Lock()
 
     def start(self) -> None:
         """Idempotent — registering twice is a no-op."""
@@ -211,10 +248,11 @@ class CoordinatorIdleObserver:
         """Dispatch both nudge paths for one IDLE event.
 
         Both paths consume the same children snapshot, computed **at
-        most once per event** and memoised behind :data:`_UNSET` (never
-        ``None`` — an indeterminate read IS ``None`` and must memoise
-        too, or a storage failure re-runs the query and can hand the
-        two paths different answers).
+        most once per event** and memoised behind an EMPTY single-slot
+        list — never behind ``None``, because an indeterminate read IS
+        ``None`` and must memoise too.  Using ``None`` as the
+        not-yet-computed marker would re-run the query after a storage
+        failure and could hand the two paths different answers.
 
         Laziness is not an optimisation detail here, it is the gate
         order: each path checks its cooldown and cap first (microsecond
@@ -315,6 +353,26 @@ class CoordinatorIdleObserver:
             return False
         if not self._try_charge(ws_id, nudge_type):
             return False
+
+        # Supersede any queued sibling — AFTER the charge (so a refused
+        # fire can never delete a wake it does not replace) and BEFORE
+        # the enqueue (so no drain can observe both).  ``channel=None``
+        # is required: a Stop demotes queued entries from "any" to
+        # "quiet", and a channel-filtered drop would miss exactly those.
+        # Loop because a class may hold up to its per-type cap.
+        sibling = _SIBLING_NUDGE_TYPE.get(nudge_type)
+        if sibling is not None:
+            dropped = 0
+            while session._nudge_queue.drop_oldest_by_type(sibling, None):
+                dropped += 1
+            if dropped:
+                log.debug(
+                    "coord_idle_observer.superseded ws=%s dropped=%d type=%s",
+                    ws_id[:8],
+                    dropped,
+                    sibling,
+                )
+
         session._nudge_queue.enqueue(
             nudge_type,
             text,
@@ -405,7 +463,7 @@ class CoordinatorIdleObserver:
         bound_user_id = ws.user_id
 
         def _still_has_active_children() -> bool:
-            now = self._active_children_now(bound_ws_id, bound_user_id)
+            now = self._children_state_at_drain(bound_ws_id, bound_user_id)
             if now is None:
                 # LIVENESS fails OPEN at drain: the entry only exists
                 # because children were active at enqueue, and dropping
@@ -517,36 +575,67 @@ class CoordinatorIdleObserver:
         if not open_tasks:
             return
 
-        text = format_idle_tasks_nudge(open_tasks)
-
-        # Structured ``_source_meta`` for the FE idle-tasks card, derived
-        # from the same normalised ``open_tasks`` list the formatter
-        # rendered into ``text`` — one source, so the card and the
-        # model-facing prose cannot drift.  ``title`` / ``note`` are
-        # sanitized identically to the formatter (``sanitize_name``) so a
-        # crafted task can't reach the operator card by a route the nudge
-        # body closes; the FE additionally renders every field via
-        # ``textContent``.  Rows arrive from ``_open_tasks`` with every
-        # field already a ``str`` (``None`` → ``""``, never ``"None"``).
-        tasks_meta = [
+        # THE ASSERTED SET.  Everything downstream — the model-facing
+        # body, the operator card's metadata, and the drain predicate's
+        # identity set — reads ``shown`` and nothing else.  Three
+        # independent derivations of "what this nudge is about" is what
+        # let the body render a capped slice while the predicate guarded
+        # the uncapped one, so a coord with more than the display cap of
+        # tasks was woken with a body naming work it had finished.
+        #
+        # ``id`` stays RAW: it is the identity key the drain predicate
+        # matches against a fresh read of storage, and sanitising one
+        # side of that comparison makes the intersection empty forever.
+        # ``id_display`` is the rendered form — the body interpolates it
+        # into a bullet line, so an embedded newline there would forge a
+        # sibling row exactly as an unsanitized title would.
+        shown = [
             {
                 "id": t["id"],
+                "id_display": sanitize_name(t["id"]),
                 "title": sanitize_name(t["title"]),
                 "status": t["status"],
                 "note": sanitize_name(t["note"]),
             }
             for t in open_tasks[:NUDGE_IDLE_TASKS_DISPLAY_CAP]
         ]
+        total_open = len(open_tasks)
 
-        # Bind identity + the enqueue-time OPEN SET by closure (never the
-        # live ``ws``).  The id set makes the predicate reject a body
-        # whose named tasks were all resolved while the entry waited —
-        # "some other task is open" is not license to deliver a snapshot
-        # naming only completed work; a fresh IDLE event will re-derive a
-        # fresh body for the survivor set.
+        text = format_idle_tasks_nudge(shown, total=total_open)
+
+        # Structured ``_source_meta`` for the FE idle-tasks card, read
+        # from the SAME ``shown`` rows the formatter rendered — the card
+        # and the model-facing prose cannot drift because there is only
+        # one list.  ``id`` is the display form here (the card renders
+        # it; nothing on the FE matches identities), and the FE also
+        # writes every field via ``textContent``.  The card carries the
+        # id because ``title`` may legitimately be empty and the prose's
+        # "(untitled)" fallback would otherwise leave the operator an
+        # unidentifiable row — the card has no other identifying column.
+        tasks_meta = [
+            {
+                "id": t["id_display"],
+                "title": t["title"],
+                "status": t["status"],
+                "note": t["note"],
+            }
+            for t in shown
+        ]
+
+        # Bind identity + the ASSERTED id set by closure (never the live
+        # ``ws``).  Scoped to ``shown``, not to every open task: the body
+        # names only these, so resolving all of them makes the body stale
+        # even if other work remains — a fresh IDLE event re-derives a
+        # fresh body for the survivors.  This is a deliberate behaviour
+        # change from binding the full open set, which let a coord with
+        # more than the display cap of tasks be woken with a body listing
+        # only finished ones.  Raw ids on both sides: ``_still_valid``
+        # re-reads storage through the same ``_open_tasks`` normaliser,
+        # so sanitising either side alone would empty the intersection
+        # permanently and silently.
         bound_ws_id = ws_id
         bound_user_id = ws.user_id
-        bound_open_ids = frozenset(t["id"] for t in open_tasks)
+        bound_open_ids = frozenset(t["id"] for t in shown if t["id"])
 
         def _still_valid() -> bool:
             # Half 1 — children.  Re-checked across the entry's whole
@@ -559,14 +648,31 @@ class CoordinatorIdleObserver:
             # predicate above, because the harms point opposite ways.
             # NOTE the checked-first order: this is the correctness
             # half; the staleness half below is only about wording.
-            now = self._active_children_now(bound_ws_id, bound_user_id)
+            #
+            # This half is LOAD-BEARING and must not be replaced by the
+            # enqueue-time supersede in ``_enqueue_nudge``.  That
+            # supersede fires only when the sibling actually ENQUEUES,
+            # which is the ``if idle_children_fired`` shape gate 2 above
+            # forbids: a coord that spawns children and calls
+            # ``wait_for_workstream`` makes ``_maybe_enqueue_children``
+            # return at its wait-tool gate BY DESIGN, so nothing
+            # supersedes and only this check catches the now-stale entry.
+            # Same when liveness is inside its own cooldown or cap.
+            now = self._children_state_at_drain(bound_ws_id, bound_user_id)
             if now is None or now:
                 return False
             # Half 2 — the task list.  Corrupt/unreadable → drop;
             # otherwise deliver only if at least one task the body NAMES
-            # is still open.
+            # is still open.  ``_open_tasks`` sits INSIDE the try: it
+            # walks raw envelope rows, so a ragged one is a data-shape
+            # condition, and letting it escape would surface as
+            # ``predicate_raised`` — which ``nudge_queue`` documents as a
+            # wiring bug, sending operators after a phantom code defect.
             try:
                 env, is_corrupt = load_task_envelope(self._storage, bound_ws_id)
+                if is_corrupt:
+                    return False
+                open_now = {t["id"] for t in self._open_tasks(env)}
             except Exception:
                 log.debug(
                     "coord_idle_observer.predicate_tasks_failed ws=%s",
@@ -574,9 +680,6 @@ class CoordinatorIdleObserver:
                     exc_info=True,
                 )
                 return False
-            if is_corrupt:
-                return False
-            open_now = {t["id"] for t in self._open_tasks(env)}
             return bool(open_now & bound_open_ids)
 
         if self._enqueue_nudge(
@@ -584,14 +687,15 @@ class CoordinatorIdleObserver:
             ws_id,
             "idle_tasks",
             text=text,
-            metadata={"tasks": tasks_meta, "total": len(open_tasks)},
+            metadata={"tasks": tasks_meta, "total": total_open},
             valid_until=_still_valid,
             cooldown_secs=cooldown_secs,
         ):
             log.info(
-                "coord_idle_observer.enqueued_tasks ws=%s open_tasks=%d",
+                "coord_idle_observer.enqueued_tasks ws=%s open_tasks=%d shown=%d",
                 ws_id[:8],
-                len(open_tasks),
+                total_open,
+                len(shown),
             )
 
     # ------------------------------------------------------------------
@@ -646,6 +750,40 @@ class CoordinatorIdleObserver:
             log.debug("coord_idle_observer.list_failed ws=%s", ws.id[:8], exc_info=True)
             return None
         return out
+
+    def _children_state_at_drain(self, ws_id: str, user_id: str) -> bool | None:
+        """Memoised drain-time answer to "does this coord have active
+        children?", shared by BOTH classes' ``valid_until`` predicates.
+
+        The sharing is the correctness property, not the saved query.
+        Two unmemoised reads can disagree within one ``drain_entries``
+        pass, and because the classes map an indeterminate read in
+        opposite directions (liveness delivers, advice drops) a
+        disagreement is exactly how both nudges reach one turn.  One
+        observation makes the opposite directions consistent: whatever
+        the answer, at most one of the two entries survives it.
+
+        Do NOT "simplify" this back into two direct
+        :meth:`_active_children_now` calls.
+        """
+        now = time.monotonic()
+        with self._drain_children_lock:
+            hit = self._drain_children.get(ws_id)
+            if hit is not None and now - hit[0] < _DRAIN_CHILDREN_TTL_SECONDS:
+                return hit[1]
+        answer = self._active_children_now(ws_id, user_id)
+        with self._drain_children_lock:
+            # Prune while we hold the lock: entries live one TTL, so the
+            # map cannot outgrow the set of coords drained in that window.
+            stale = [
+                k
+                for k, (t, _) in self._drain_children.items()
+                if now - t >= _DRAIN_CHILDREN_TTL_SECONDS
+            ]
+            for k in stale:
+                del self._drain_children[k]
+            self._drain_children[ws_id] = (now, answer)
+        return answer
 
     def _active_children_now(self, ws_id: str, user_id: str) -> bool | None:
         """Drain-time answer to "does this coord have active children?"
@@ -703,16 +841,29 @@ class CoordinatorIdleObserver:
         rows = envelope.get("tasks") or []
         if not isinstance(rows, list):
             return []
-        return [
-            {
-                "id": _field_str(row.get("id")),
-                "title": _field_str(row.get("title")),
-                "status": row["status"],
-                "note": _field_str(row.get("note")),
-            }
-            for row in rows
-            if isinstance(row, dict) and row.get("status") in TASK_OPEN_STATUSES
-        ]
+        out: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Coerce BEFORE the membership test.  ``TASK_OPEN_STATUSES``
+            # is a frozenset, so a non-hashable value (``status: []`` in
+            # a hand-edited blob) raises ``TypeError`` from the ``in``
+            # itself — not caught as an unknown status but escaping the
+            # whole nudge path, which the observer swallows, silencing
+            # this coordinator's nudge permanently.  Coerced, it simply
+            # fails to match and the row is skipped.
+            status = _field_str(row.get("status"))
+            if status not in TASK_OPEN_STATUSES:
+                continue
+            out.append(
+                {
+                    "id": _field_str(row.get("id")),
+                    "title": _field_str(row.get("title")),
+                    "status": status,
+                    "note": _field_str(row.get("note")),
+                }
+            )
+        return out
 
     # ------------------------------------------------------------------
     # cap accounting

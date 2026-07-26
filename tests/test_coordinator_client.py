@@ -3000,3 +3000,65 @@ def test_legacy_task_row_without_note_round_trips(tmp_path):
     updated = client.tasks_update("coord-1", task_id=task["id"], status="in_progress")
     assert updated["status"] == "in_progress"
     assert "note" not in updated
+
+
+# ---------------------------------------------------------------------------
+# write-path sanitisation (title / note)
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_add_sanitises_note_and_title(tmp_path):
+    """Sanitising at the WRITE is what reaches the two surfaces the
+    operator ACTS on — the tasks sidebar and (via its own pass) the
+    approval preview.  The nudge formatter's sanitiser never sees those."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add(
+        "coord-1",
+        title="audit <thinking>auth</thinking>",
+        note="do not ‮evorppa",
+    )
+    assert "error" not in task
+    assert "<" not in task["title"] and ">" not in task["title"]
+    assert "‮" not in task["note"]
+
+
+def test_tasks_length_check_measures_what_the_model_sent(tmp_path):
+    """Order is load-bearing: length BEFORE sanitise.  Measuring after
+    would report a length the model never sent, so a 201-char value made
+    of strippable characters would be silently accepted — breaking the
+    reject-don't-truncate contract the cap documents."""
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title="a" * 201)
+    assert "error" in result and "201 chars" in result["error"]
+    # 201 chars of angle brackets sanitise to "", but the model still
+    # sent 201 characters and must be told so.
+    result2 = client.tasks_add("coord-1", title="<" * 201)
+    assert "error" in result2 and "too long" in result2["error"]
+
+
+def test_tasks_add_rejects_title_that_sanitises_away(tmp_path):
+    """Emptiness is re-tested AFTER sanitising, or a title of only
+    angle brackets slips past the guard that forbids an empty one."""
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title="<>")
+    assert "error" in result
+    assert "required" in result["error"]
+
+
+def test_tasks_update_rejects_title_that_sanitises_away(tmp_path):
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="real title")
+    result = client.tasks_update("coord-1", task_id=task["id"], title="<>")
+    assert "error" in result
+    assert "cannot be empty" in result["error"]
+    # The original survives the rejection.
+    assert client.tasks_get("coord-1")["tasks"][0]["title"] == "real title"
+
+
+def test_tasks_update_note_that_sanitises_away_clears(tmp_path):
+    """A note of only strippable characters is the same request as an
+    empty one — it clears, and the absent-by-default shape is kept."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="t", note="real note")
+    updated = client.tasks_update("coord-1", task_id=task["id"], note="<>")
+    assert "note" not in updated

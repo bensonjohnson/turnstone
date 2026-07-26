@@ -121,6 +121,7 @@ from turnstone.core.metacognition import (
     detect_completion,
     detect_correction,
     format_nudge,
+    sanitize_name,
     sanitize_payload,
     should_nudge,
 )
@@ -14178,16 +14179,26 @@ class ChatSession:
             # a module-level ``judge`` import is a cycle.
             from turnstone.core.judge import honest_truncate
 
+            # The approval preview reads the RAW tool args, before any
+            # write, so the storage-side sanitiser never sees these
+            # bytes.  The operator rules on this string — a bidi
+            # override or zero-width run here renders them a decision
+            # different from the one they are approving.  Sanitise the
+            # PREVIEW strings only; ``item["title"]`` / ``item["note"]``
+            # stay raw so ``_exec_tasks`` still hands the write path what
+            # the model actually sent.
+            preview_title = sanitize_name(title)
+            preview_note = sanitize_name(note)
             item["header"] = (
-                f"\u2699 tasks add: {honest_truncate(title, _TASK_PREVIEW_FIELD_CHARS)}"
+                f"\u2699 tasks add: {honest_truncate(preview_title, _TASK_PREVIEW_FIELD_CHARS)}"
             )
             # The note rides the preview because it is the operator-facing
             # payload of the mutation — approving a ``needs_operator`` task
             # without seeing what the coordinator is asking for defeats the
             # point of the approval.
             add_bits = [f"status={status}", f"child_ws_id={child_ws_id or '-'}"]
-            if note:
-                add_bits.append(f"note={honest_truncate(note, _TASK_PREVIEW_FIELD_CHARS)}")
+            if preview_note:
+                add_bits.append(f"note={honest_truncate(preview_note, _TASK_PREVIEW_FIELD_CHARS)}")
             item["preview"] = " ".join(add_bits)
             item["title"] = title
             item["status"] = status
@@ -14245,8 +14256,14 @@ class ChatSession:
 
             item["header"] = f"\u2699 tasks update: {task_id}"
             bits: list[str] = []
+            # Preview strings are sanitised here and NOT stored back onto
+            # the item — the approval surface reads raw args before any
+            # write, so the storage sanitiser never sees them, while
+            # ``item[...]`` must stay raw for the write path.
             if upd_title is not None:
-                bits.append(f"title={honest_truncate(upd_title, _TASK_PREVIEW_FIELD_CHARS)}")
+                bits.append(
+                    f"title={honest_truncate(sanitize_name(upd_title), _TASK_PREVIEW_FIELD_CHARS)}"
+                )
             if upd_status is not None:
                 bits.append(f"status={upd_status}")
             if upd_child is not None:
@@ -14255,7 +14272,9 @@ class ChatSession:
                 # ``or '-'`` renders an explicit clear (``""``) the same
                 # way ``child_ws_id`` renders one, so the operator sees
                 # "note=-" rather than an empty tail.
-                bits.append(f"note={honest_truncate(upd_note, _TASK_PREVIEW_FIELD_CHARS) or '-'}")
+                bits.append(
+                    f"note={honest_truncate(sanitize_name(upd_note), _TASK_PREVIEW_FIELD_CHARS) or '-'}"
+                )
             item["preview"] = " ".join(bits)
             item["task_id"] = task_id
             item["title"] = upd_title

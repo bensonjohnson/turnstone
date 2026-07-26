@@ -1158,8 +1158,14 @@
   margin-left: 6px;
   font-size: 11px;
 }
-/* Tasks-only: the per-task note (what the coordinator needs from the
-   operator) and the overflow line past the producer's display cap. */
+/* Tasks-only: the id column (a task's title may be empty, so the card
+   needs another identifying string), the per-task note, and the overflow
+   line past the producer's display cap. */
+.msg.idle-tasks .msg-idle-child-ident {
+  color: var(--ink-4);
+  font-size: 11px;
+  margin-right: 6px;
+}
 .msg.idle-tasks .msg-idle-note {
   color: var(--ink-4);
   font-size: 11px;

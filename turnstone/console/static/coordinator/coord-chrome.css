@@ -436,7 +436,13 @@
     font-size: 13px;
   }
 }
+/* Same wrap rule as `.task-row .meta` below: a title is model-authored
+   free text up to _TASK_TITLE_MAX, and `.task-row` is a column flexbox
+   whose items default to `min-width: auto`, so an unbroken 200-char
+   token forces the fixed-width sidebar without this. */
 .task-row .title {
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-weight: 500;
   color: var(--ink);
 }

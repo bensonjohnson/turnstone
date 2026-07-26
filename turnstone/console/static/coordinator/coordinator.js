@@ -973,7 +973,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // generic history-replay branch already renders unknown roles via
     // appendText("system", …); this variant gives it the operator styling.
     // The `operator-context` marker is shared by every operator row (this
-    // bubble + the watch-result / guard-finding / idle-children cards) so the
+    // bubble + the watch-result / guard-finding / idle-children / idle-tasks cards) so the
     // retry-skip walk in _refreshRetryButton can skip them all uniformly.
     system: "system-context operator-context",
   };
@@ -1114,6 +1114,17 @@ function createCoordinatorPane(root, wsId, opts) {
       const r = rows[i] || {};
       const li = document.createElement("li");
       li.className = "msg-idle-child";
+      if (r.ident) {
+        // Optional identifier column. The tasks card needs it because a
+        // task's title may legitimately be empty, and the producer's
+        // "(untitled)" fallback would otherwise leave the operator a row
+        // they cannot match to anything. Children rows pass none — their
+        // name already IS the identifier.
+        const ident = document.createElement("span");
+        ident.className = "msg-idle-child-ident";
+        ident.textContent = String(r.ident);
+        li.appendChild(ident);
+      }
       const name = document.createElement("span");
       name.className = "msg-idle-child-name";
       name.textContent = String(r.name || "");
@@ -1187,8 +1198,14 @@ function createCoordinatorPane(root, wsId, opts) {
   function appendIdleTasks(meta) {
     const tasks = Array.isArray(meta.tasks) ? meta.tasks : [];
     const total = typeof meta.total === "number" ? meta.total : tasks.length;
+    // The producer already applied the "(untitled)" fallback, so the card
+    // and the model-facing prose show the same label for every row; the
+    // id rides alongside as `ident` so an untitled row is still
+    // identifiable. Do NOT reintroduce a `|| t.id` fallback on `name` —
+    // that is what made the two surfaces disagree.
     const rows = tasks.map((t) => ({
-      name: (t && (t.title || t.id)) || "task",
+      ident: t && t.id ? String(t.id) : "",
+      name: (t && t.title) || "(untitled)",
       state: t && t.status ? taskStatusLabel(String(t.status)) : "",
       note: t && t.note ? String(t.note) : "",
     }));
@@ -3590,7 +3607,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // user interjection, metacognitive nudge, watch result — see
         // make_system_turn).  Rendered in trajectory sequence (it FOLLOWS the
         // turn it advises).  ``renderSystemTurn`` routes by ``ev.source`` to the
-        // structured card (watch / guard / idle-children) or the operator bubble
+        // structured card (watch / guard / idle-children / idle-tasks) or the operator bubble
         // (carrying ``ev.meta`` so cards rebuild identically live and on replay).
         // Dedup: skip a turn already painted from /history (matched by id) and
         // redelivered by an SSE replay past the resume cursor.  With the
@@ -5880,7 +5897,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // Skip retry when the most recent semantic turn is tool-only (last DOM
     // child is a .conv-batch construct); walk back past operator-context
     // rows first — the plain system bubble AND the structured watch-result /
-    // guard-finding / idle-children cards all carry .operator-context — so the
+    // guard-finding / idle-children / idle-tasks cards all carry .operator-context — so the
     // guard still fires when the tool turn carried a nudge / guard finding.
     // Keying on the shared marker (not any single card class) keeps the skip
     // correct as new card kinds are added. (Both personas now render the
@@ -6406,7 +6423,7 @@ function createCoordinatorPane(root, wsId, opts) {
         } else if (role === "system") {
           // First-class operator-context system turn — ``renderSystemTurn``
           // routes by ``m.source`` to the structured card (watch / guard /
-          // idle-children) or the operator bubble, reading ``m.meta`` from the
+          // idle-children / idle-tasks) or the operator bubble, reading ``m.meta`` from the
           // ``/history`` projection so replay matches the live render exactly.
           if (!content) return;
           renderSystemTurn(m.source || "", content, m.meta);
