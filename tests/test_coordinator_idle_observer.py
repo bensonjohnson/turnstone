@@ -100,9 +100,6 @@ class _FakeSession:
         # Tools the persona envelope hides — drives _persona_tool_visible.
         self.hidden_tools: set[str] = set()
 
-    def _visible_memory_count(self) -> int:
-        return 0
-
     def _persona_tool_visible(self, name: str) -> bool:
         return name not in self.hidden_tools
 

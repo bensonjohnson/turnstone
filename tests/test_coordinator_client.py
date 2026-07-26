@@ -3030,6 +3030,55 @@ def test_tasks_length_check_measures_what_the_model_sent(tmp_path):
     assert "error" in result and "201 chars" in result["error"]
 
 
+def test_tasks_add_rejects_unrenderable_title(tmp_path):
+    """The one carve-out from verbatim storage: text that sanitises to
+    NOTHING renders on no operator surface while ``tasks(list)`` feeds it
+    back to the model every call — an operator-invisible, model-visible
+    payload channel.  Rejected with a hint, mirroring reject-don't-truncate."""
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title="<>")
+    assert "error" in result
+    assert "no renderable characters" in result["error"]
+    assert "retry" in result["error"]
+
+
+def test_tasks_add_rejects_unrenderable_note(tmp_path):
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title="t", note=chr(0x200B) * 2)
+    assert "error" in result and "no renderable characters" in result["error"]
+
+
+def test_tasks_update_rejects_unrenderable_title_and_note(tmp_path):
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="keep", note="keep note")
+    res_t = client.tasks_update("coord-1", task_id=task["id"], title=chr(0x202E) + chr(0x200B))
+    assert "error" in res_t and "no renderable characters" in res_t["error"]
+    res_n = client.tasks_update("coord-1", task_id=task["id"], note="<>")
+    assert "error" in res_n and "no renderable characters" in res_n["error"]
+    # Either reject leaves the stored row untouched.
+    row = client.tasks_get("coord-1")["tasks"][0]
+    assert row["title"] == "keep" and row["note"] == "keep note"
+
+
+def test_tasks_unrenderable_check_runs_after_length(tmp_path):
+    """Order ruling: length first (measured on what the model sent), then
+    renderability — a 250-char zero-width run hears "too long", not
+    "unrenderable", so the two hints cannot mask each other."""
+    client = _task_client(tmp_path)
+    result = client.tasks_add("coord-1", title=chr(0x200B) * 250)
+    assert "error" in result and "too long" in result["error"]
+
+
+def test_tasks_update_empty_note_still_clears_after_the_reject(tmp_path):
+    """The reject must not eat the legal CLEAR: ``note=""`` stays a
+    clear; only a NON-empty note that sanitises to nothing is rejected."""
+    client = _task_client(tmp_path)
+    task = client.tasks_add("coord-1", title="t", note="real")
+    cleared = client.tasks_update("coord-1", task_id=task["id"], note="")
+    assert "error" not in cleared
+    assert "note" not in cleared
+
+
 def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path):
     """The pane's copy IS sanitised — a bidi override must not make the
     operator read an ask in an order different from the stored one."""
@@ -3049,3 +3098,20 @@ def test_display_sanitiser_passes_ragged_rows_through(tmp_path):
 
     out = _sanitize_task_envelope_for_display({"version": 1, "tasks": ["not a dict", 42]})
     assert out["tasks"] == ["not a dict", 42]
+
+
+def test_display_sanitiser_coerces_ragged_rows_like_the_nudge_card(tmp_path):
+    """Shared ``_field_str`` coercion: ``str(x or "")`` mapped ``0`` to
+    ``""`` while the nudge card's producer rendered ``"0"`` — two
+    operator-facing surfaces disagreeing on the same stored row.  And a
+    coerced ``status`` means the FE's ``task.status || "pending"``
+    fallback cannot mislabel a ragged row as pending."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
+    out = _sanitize_task_envelope_for_display(
+        {"version": 1, "tasks": [{"id": "t", "title": 0, "status": 0, "child_ws_id": None}]}
+    )
+    row = out["tasks"][0]
+    assert row["title"] == "0"
+    assert row["status"] == "0"
+    assert row["child_ws_id"] == ""

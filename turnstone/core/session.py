@@ -14180,6 +14180,51 @@ class ChatSession:
             "execute": self._exec_tasks,
             "action": action,
         }
+
+        # Deferred import shared by every mutating branch below — ONE site,
+        # above the branches, so per-branch copies cannot drift.  Deferred
+        # to keep ``judge`` (and its provider-client dependencies) off this
+        # module's import cost until a tasks mutation actually needs a
+        # preview; NOT a cycle guard — no judge<->session import cycle
+        # exists at HEAD.
+        from turnstone.core.judge import honest_truncate
+
+        def _pf(value: str) -> str:
+            """Preview-field render for the approval surface.
+
+            EVERY model-controlled string on the header/preview goes
+            through here — ``task_id``/``status``/``child_ws_id``/reorder
+            ids included, not just free text: a newline in ``task_id``
+            forges an extra header line in the channel formatter and in
+            ``buildConvCmd``'s line-classified command view, and a bidi
+            override reorders the decision the operator reads.  A
+            non-empty value that sanitises to nothing renders an explicit
+            marker (angle-bracket-free, so a future sanitise-the-whole-
+            preview edit cannot eat it) — it must never collapse to ``""``
+            and collide with the ``'-'`` explicit-clear convention or
+            vanish from the surface the operator rules on.
+            """
+            display = honest_truncate(sanitize_name(value), _TASK_PREVIEW_FIELD_CHARS)
+            if value and not display:
+                return f"[unrenderable: {len(value)} chars]"
+            return display
+
+        def _unrenderable(prefix: str, field: str, raw: str) -> dict[str, Any]:
+            """Reject-with-hint for stored text that sanitises to nothing.
+
+            Mirrors ``coordinator_client._unrenderable_error`` (the
+            authoritative copy on the write path); this early copy spares
+            the operator an approval card for a call that cannot land.
+            """
+            return self._coord_tool_error(
+                call_id,
+                "tasks",
+                f"{prefix}: {field} contains no renderable characters "
+                f"({len(raw)} chars of control/zero-width/bidi codepoints "
+                "or angle brackets, which operator displays strip).  "
+                f"Rewrite {field} in plain printable text and retry.",
+            )
+
         if action == "add":
             # Reject non-string title / status / child_ws_id up front so
             # a malformed model call (``title=42``) produces a clean tool
@@ -14196,30 +14241,33 @@ class ChatSession:
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
             note = self._coord_str_arg(args, "note").strip()
-            # Local import mirroring ``_project_func_args``' own sites —
-            # a module-level ``judge`` import is a cycle.
-            from turnstone.core.judge import honest_truncate
-
+            # Reject-with-hint for text that sanitises to NOTHING (all
+            # control/zero-width/bidi codepoints or bare angle brackets):
+            # stored verbatim it would render on no operator surface while
+            # ``tasks(list)`` feeds it back to the model every call — the
+            # write path (``tasks_add``) rejects it authoritatively too;
+            # this early copy spares the operator an approval card for a
+            # call that cannot land.
+            if not sanitize_name(title):
+                return _unrenderable("add", "title", title)
+            if note and not sanitize_name(note):
+                return _unrenderable("add", "note", note)
             # The approval preview reads the RAW tool args, before any
             # write, so the storage-side sanitiser never sees these
             # bytes.  The operator rules on this string — a bidi
             # override or zero-width run here renders them a decision
-            # different from the one they are approving.  Sanitise the
-            # PREVIEW strings only; ``item["title"]`` / ``item["note"]``
-            # stay raw so ``_exec_tasks`` still hands the write path what
-            # the model actually sent.
-            preview_title = sanitize_name(title)
-            preview_note = sanitize_name(note)
-            item["header"] = (
-                f"\u2699 tasks add: {honest_truncate(preview_title, _TASK_PREVIEW_FIELD_CHARS)}"
-            )
+            # different from the one they are approving.  Render every
+            # model-controlled field through ``_pf``; ``item[...]`` stays
+            # raw so ``_exec_tasks`` still hands the write path what the
+            # model actually sent.
+            item["header"] = f"\u2699 tasks add: {_pf(title)}"
             # The note rides the preview because it is the operator-facing
             # payload of the mutation — approving a ``needs_operator`` task
             # without seeing what the coordinator is asking for defeats the
             # point of the approval.
-            add_bits = [f"status={status}", f"child_ws_id={child_ws_id or '-'}"]
-            if preview_note:
-                add_bits.append(f"note={honest_truncate(preview_note, _TASK_PREVIEW_FIELD_CHARS)}")
+            add_bits = [f"status={_pf(status)}", f"child_ws_id={_pf(child_ws_id) or '-'}"]
+            if note:
+                add_bits.append(f"note={_pf(note)}")
             item["preview"] = " ".join(add_bits)
             item["title"] = title
             item["status"] = status
@@ -14273,29 +14321,44 @@ class ChatSession:
             # and ``""`` (clear) stays distinct from ``None`` throughout.
             if isinstance(upd_note, str):
                 upd_note = upd_note.strip()
-            from turnstone.core.judge import honest_truncate
+            # Reject-with-hint, mirroring the add branch: a title/note
+            # that sanitises to nothing must never reach the approval
+            # card; its preview would read as absent (title) or as the
+            # explicit CLEAR marker (note=-) while execute stores the raw
+            # payload, so the operator would approve the opposite of what
+            # runs.  upd_note == "" stays a legal CLEAR, not rejected.
+            if (
+                isinstance(upd_title, str)
+                and upd_title.strip()
+                and not sanitize_name(upd_title.strip())
+            ):
+                return _unrenderable("update", "title", upd_title.strip())
+            if upd_note and not sanitize_name(upd_note):
+                return _unrenderable("update", "note", upd_note)
 
-            item["header"] = f"\u2699 tasks update: {task_id}"
+            item["header"] = f"\u2699 tasks update: {_pf(task_id)}"
             bits: list[str] = []
-            # Preview strings are sanitised here and NOT stored back onto
-            # the item — the approval surface reads raw args before any
-            # write, so the storage sanitiser never sees them, while
-            # ``item[...]`` must stay raw for the write path.
+            # Preview strings are rendered through ``_pf`` and NOT stored
+            # back onto the item — the approval surface reads raw args
+            # before any write, so the storage sanitiser never sees them,
+            # while ``item[...]`` must stay raw for the write path:
+            # ``task_id`` feeds ``tasks_update``/``tasks_remove`` by exact
+            # match and ``task_ids`` feeds the reorder permutation check,
+            # so sanitising the STORED values would silently turn every
+            # mutation into "task not found".
             if upd_title is not None:
-                bits.append(
-                    f"title={honest_truncate(sanitize_name(upd_title), _TASK_PREVIEW_FIELD_CHARS)}"
-                )
+                bits.append(f"title={_pf(upd_title)}")
             if upd_status is not None:
-                bits.append(f"status={upd_status}")
+                bits.append(f"status={_pf(upd_status)}")
             if upd_child is not None:
-                bits.append(f"child_ws_id={upd_child or '-'}")
+                bits.append(f"child_ws_id={_pf(upd_child) or '-'}")
             if upd_note is not None:
                 # ``or '-'`` renders an explicit clear (``""``) the same
                 # way ``child_ws_id`` renders one, so the operator sees
-                # "note=-" rather than an empty tail.
-                bits.append(
-                    f"note={honest_truncate(sanitize_name(upd_note), _TASK_PREVIEW_FIELD_CHARS) or '-'}"
-                )
+                # "note=-" rather than an empty tail.  The sanitise-to-
+                # empty case cannot reach here (rejected above), so ``-``
+                # is unambiguous again.
+                bits.append(f"note={_pf(upd_note) or '-'}")
             item["preview"] = " ".join(bits)
             item["task_id"] = task_id
             item["title"] = upd_title
@@ -14306,7 +14369,7 @@ class ChatSession:
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
                 return self._coord_tool_error(call_id, "tasks", "remove: task_id is required")
-            item["header"] = f"\u2699 tasks remove: {task_id}"
+            item["header"] = f"\u2699 tasks remove: {_pf(task_id)}"
             item["preview"] = ""
             item["task_id"] = task_id
         elif action == "reorder":
@@ -14316,7 +14379,9 @@ class ChatSession:
                     call_id, "tasks", "reorder: task_ids must be a list of strings"
                 )
             item["header"] = f"\u2699 tasks reorder: {len(raw_ids)} ids"
-            item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
+            item["preview"] = ",".join(_pf(x) for x in raw_ids[:6]) + (
+                "..." if len(raw_ids) > 6 else ""
+            )
             item["task_ids"] = raw_ids
         return item
 

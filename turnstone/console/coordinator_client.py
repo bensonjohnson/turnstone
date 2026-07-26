@@ -38,6 +38,7 @@ import httpx
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
+from turnstone.core.metacognition import sanitize_name
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -241,6 +242,32 @@ def _too_long_error(field: str, length: int, cap: int) -> dict[str, Any]:
     (the model may rely on the value it SENT, not the stored one).
     """
     return {"error": (f"{field} too long ({length} chars, max {cap}).  Shorten and retry.")}
+
+
+def _unrenderable_error(field: str, length: int) -> dict[str, Any]:
+    """The shared reject for text that sanitises to nothing.
+
+    A value made entirely of characters every operator surface strips
+    (C0/C1 controls, zero-width/bidi steering codepoints, bare ``<``/``>``)
+    would store verbatim, render as NOTHING on every operator display, and
+    be fed back to the model on every ``tasks(list)`` — and from there into
+    the compaction summariser's input and the cross-workstream ``recall``
+    index: an operator-invisible, model-visible payload.  Storage stays
+    verbatim for text that renders (see the ruling in ``tasks_add``); text
+    that cannot render at all is rejected with a hint instead, mirroring
+    ``_too_long_error``'s reject-don't-mutate rule.  ``_prepare_tasks``
+    carries an early copy of this reject so the operator is never shown an
+    approval card for a call that cannot land; this builder is the
+    authoritative one, covering the HTTP/maintenance callers too.
+    """
+    return {
+        "error": (
+            f"{field} contains no renderable characters ({length} chars of "
+            "control/zero-width/bidi codepoints or angle brackets, which "
+            f"operator displays strip).  Rewrite {field} in plain printable "
+            "text and retry."
+        )
+    }
 
 
 # Short TTL on the per-ws_id live-inspect cache.  Back-to-back inspect()
@@ -1713,6 +1740,11 @@ class CoordinatorClient:
         # belongs at each OPERATOR-FACING render — the nudge formatter,
         # the approval preview, and the tasks HTTP read — while storage
         # and the model's own ``tasks(list)`` see what the model sent.
+        # ONE carve-out: text that sanitises to NOTHING is rejected
+        # outright (``_unrenderable_error``) rather than stored — verbatim
+        # storage is for text that renders somewhere; a value invisible on
+        # every operator surface but re-read by the model on each ``list``
+        # is a payload channel, not planning text.
         clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
@@ -1721,6 +1753,14 @@ class CoordinatorClient:
             return _too_long_error("title", len(clean_title), _TASK_TITLE_MAX)
         if len(clean_note) > _TASK_NOTE_MAX:
             return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
+        # Length first (measured on what the model sent), THEN
+        # renderability — a 250-char run of zero-widths should hear "too
+        # long", not "unrenderable", so the two hints cannot mask each
+        # other.
+        if not sanitize_name(clean_title):
+            return _unrenderable_error("title", len(clean_title))
+        if clean_note and not sanitize_name(clean_note):
+            return _unrenderable_error("note", len(clean_note))
         if status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
@@ -1786,6 +1826,10 @@ class CoordinatorClient:
             clean_note = note.strip()
             if len(clean_note) > _TASK_NOTE_MAX:
                 return _too_long_error("note", len(clean_note), _TASK_NOTE_MAX)
+            # ``""`` stays a legal CLEAR; only a non-empty note that
+            # sanitises to nothing is rejected (see ``_unrenderable_error``).
+            if clean_note and not sanitize_name(clean_note):
+                return _unrenderable_error("note", len(clean_note))
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
@@ -1798,6 +1842,8 @@ class CoordinatorClient:
                             return {"error": "title cannot be empty"}
                         if len(clean) > _TASK_TITLE_MAX:
                             return _too_long_error("title", len(clean), _TASK_TITLE_MAX)
+                        if not sanitize_name(clean):
+                            return _unrenderable_error("title", len(clean))
                         t["title"] = clean
                     if status is not None:
                         t["status"] = status

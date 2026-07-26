@@ -1966,6 +1966,123 @@ def test_tasks_update_whitespace_note_previews_as_clear(coord_session):
     assert "note=-" in item["preview"]
 
 
+def test_tasks_prepare_rejects_unrenderable_note_before_approval(coord_session):
+    """The sanitise-to-empty sibling of the whitespace divergence above,
+    in reverse: an update note made only of stripped characters previewed
+    as ``note=-`` (the explicit-CLEAR marker) while execute stored the
+    raw payload — the operator approved a clear and got a SET.  Rejected
+    at prepare now (the write path rejects authoritatively too), so the
+    approval card can never carry the lie."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "note": chr(0x200B) * 3})
+    )
+    assert "error" in item
+    assert "no renderable characters" in item["error"]
+    assert "retry" in item["error"]  # reject WITH hint
+
+
+def test_tasks_prepare_rejects_unrenderable_add_title_and_note(coord_session):
+    """The add-branch siblings: an unrenderable title creates a task no
+    operator surface can name; an unrenderable note was silently OMITTED
+    from the preview while storing verbatim."""
+    sess, _coord, _ui = coord_session
+    t = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "<>"}))
+    assert "error" in t and "no renderable characters" in t["error"]
+    n = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "ok", "note": chr(0x202E)}))
+    assert "error" in n and "no renderable characters" in n["error"]
+
+
+def test_tasks_update_header_sanitizes_and_truncates_task_id(coord_session):
+    """Every model-controlled string on the approval surface renders via
+    ``_pf`` — a newline in ``task_id`` forges an extra header line in the
+    channel formatter (which truncates preview but NOT header) and in
+    buildConvCmd's line-classified view.  ``item["task_id"]`` stays raw:
+    it feeds ``tasks_update`` by exact match, so sanitising the stored
+    value would turn every mutation into "task not found"."""
+    sess, _coord, _ui = coord_session
+    raw_id = "tsk_a" + chr(10) + "FAKE APPROVAL LINE"
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": raw_id, "status": "done"})
+    )
+    assert "error" not in item
+    assert chr(10) not in item["header"]
+    assert item["task_id"] == raw_id
+    long_item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "t" * 200, "status": "done"})
+    )
+    assert "chars omitted]" in long_item["header"]
+
+
+def test_tasks_remove_header_sanitizes_task_id(coord_session):
+    sess, _coord, _ui = coord_session
+    raw_id = "tsk" + chr(10) + "x"
+    item = sess._prepare_tool(_tc("tasks", {"action": "remove", "task_id": raw_id}))
+    assert "error" not in item
+    assert chr(10) not in item["header"]
+    assert item["task_id"] == raw_id
+
+
+def test_tasks_preview_sanitizes_status_and_child_ws_id(coord_session):
+    """``status``/``child_ws_id`` rode the preview raw — a bidi override
+    there reorders the decision the operator reads, which is the exact
+    attack the title/note sanitisation ruling was added to stop."""
+    sess, _coord, _ui = coord_session
+    raw_status = "done" + chr(0x202E)
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "status": raw_status,
+                "child_ws_id": "ws-1" + chr(10) + "x",
+            },
+        )
+    )
+    assert "error" not in item
+    assert chr(0x202E) not in item["preview"]
+    assert chr(10) not in item["preview"]
+    # Raw values still flow to execute untouched.
+    assert item["status"] == raw_status
+
+
+def test_tasks_preview_marks_unrenderable_child_ws_id(coord_session):
+    """``child_ws_id``'s ``-`` means "explicit clear".  A value that
+    sanitises to empty must render the unrenderable marker, NOT ``-`` —
+    otherwise the operator approves a clear while execute stores the
+    payload: the note divergence exported to a new field by the very
+    sanitisation that fixed it there."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "child_ws_id": "<>"})
+    )
+    assert "error" not in item
+    assert "child_ws_id=[unrenderable: 2 chars]" in item["preview"]
+    assert item["child_ws_id"] == "<>"
+
+
+def test_tasks_reorder_preview_sanitizes_ids(coord_session):
+    sess, _coord, _ui = coord_session
+    raw_ids = ["a" + chr(10) + "b", "c"]
+    item = sess._prepare_tool(_tc("tasks", {"action": "reorder", "task_ids": raw_ids}))
+    assert "error" not in item
+    assert chr(10) not in item["preview"]
+    assert item["task_ids"] == raw_ids
+
+
+def test_prepare_tasks_imports_honest_truncate_once():
+    """ONE deferred import above the action branches — a second copy per
+    branch is how the two drift (the old per-branch comment also claimed
+    a judge import cycle that does not exist at HEAD)."""
+    import inspect
+
+    from turnstone.core.session import ChatSession
+
+    src = inspect.getsource(ChatSession._prepare_tasks)
+    assert src.count("from turnstone.core.judge import honest_truncate") == 1
+
+
 def test_tasks_update_none_note_stays_unchanged(coord_session):
     """The strip must preserve the None/"" distinction: None means
     "unchanged", "" means "clear"."""
