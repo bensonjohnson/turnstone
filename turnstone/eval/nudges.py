@@ -548,6 +548,22 @@ def _body_override(header_text: str | None) -> Any:
         _metacog.NUDGE_IDLE_TASKS_HEADER = original
 
 
+def _endpoint_identity(base_url: str, api_key: str) -> dict[str, Any] | None:
+    """The served model's identity stamp (``id`` + ``created``).
+
+    A served-name is NOT an identity: a vLLM restart mid-arc swapped
+    behavior under the same alias and silently invalidated a sweep
+    (the created timestamp was the only witness).  Best-effort — an
+    endpoint without ``/models`` yields ``None``, never an error.
+    """
+    try:
+        data = OpenAI(base_url=base_url, api_key=api_key, timeout=10.0).models.list()
+        m = data.data[0]
+        return {"id": m.id, "created": getattr(m, "created", None)}
+    except Exception:
+        return None
+
+
 def run_nudge_response(
     *,
     base_url: str,
@@ -572,7 +588,8 @@ def run_nudge_response(
     forbidden_rate, runs}}}}`` — bars are applied by the operator after
     the baseline sweep, not encoded here.
     """
-    out: dict[str, Any] = {"model": model, "cells": {}}
+    ident_start = _endpoint_identity(base_url, api_key)
+    out: dict[str, Any] = {"model": model, "endpoint_start": ident_start, "cells": {}}
     with _body_override(body_override_text):
         for ci, case in enumerate(cells):
             cell_arms = arms or case.get("arms", [ARM_NUDGE])
@@ -625,4 +642,13 @@ def run_nudge_response(
                     "runs": runs,
                 }
             out["cells"][case["id"]] = cell_out
+    ident_end = _endpoint_identity(base_url, api_key)
+    out["endpoint_end"] = ident_end
+    out["endpoint_drifted"] = bool(ident_start and ident_end and ident_start != ident_end)
+    if out["endpoint_drifted"]:
+        print(
+            f"\n  {RED}ENDPOINT DRIFTED MID-SWEEP{RESET}: {ident_start} -> {ident_end}\n"
+            "  The serving instance changed under the alias; results in this\n"
+            "  file are NOT comparable to other sweeps or to themselves."
+        )
     return out
