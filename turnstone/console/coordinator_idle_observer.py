@@ -516,6 +516,21 @@ class CoordinatorIdleObserver:
         """
         ws_id = ws.id
 
+        # Gate: the operator stopped this generation.  An abandoned turn
+        # ends in ``_emit_state("idle")``, and that IDLE reaches here —
+        # so without this check pressing Stop on a coord holding open
+        # tasks enqueues a wake-eligible entry AFTER the cancel path
+        # demoted the queue to quiet, and the watcher resumes the
+        # workstream seconds later.  The operator said stop; a task
+        # reminder is not a reason to override that.
+        #
+        # ADVICE only.  Liveness deliberately still fires: a cancelled
+        # coordinator can still have children running whose results
+        # would otherwise be abandoned, which is the outcome that class
+        # exists to prevent.
+        if session._generation_abandoned:
+            return
+
         if not session._nudges_enabled("idle_tasks"):
             return
 
@@ -636,6 +651,22 @@ class CoordinatorIdleObserver:
         bound_ws_id = ws_id
         bound_user_id = ws.user_id
         bound_open_ids = frozenset(t["id"] for t in shown if t["id"])
+        if not bound_open_ids:
+            # No usable identity for anything the body names (every shown
+            # row came from a ragged envelope with no ``id``), so the
+            # drain predicate could never match and the entry would be
+            # enqueued and then dropped at every drain — silently
+            # spending a cap slot and stamping the 300s cooldown each
+            # time, until the coordinator's whole advice budget is gone
+            # and it is never reminded at all.  Refusing to make a claim
+            # we cannot re-validate is the honest failure: it costs
+            # nothing and leaves the budget for a well-formed list.
+            log.debug(
+                "coord_idle_observer.tasks_unidentifiable ws=%s shown=%d (no nudge)",
+                ws_id[:8],
+                len(shown),
+            )
+            return
 
         def _still_valid() -> bool:
             # Half 1 — children.  Re-checked across the entry's whole

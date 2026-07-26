@@ -59,6 +59,7 @@ from turnstone.core.auth import (
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
+from turnstone.core.metacognition import sanitize_name
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -4377,7 +4378,42 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
         return err404
 
     envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
+
+
+def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Sanitise the operator-facing copy of a task envelope.
+
+    ``title`` and ``note`` are model-authored free text and this response
+    feeds the operator's tasks pane, so a bidi override or zero-width run
+    could make the pane display an ask in an order different from the one
+    stored — on a ``needs_operator`` row, the one the operator acts on.
+
+    Sanitising happens at each operator-facing render (here, the nudge
+    formatter, the approval preview) rather than at the write, because
+    ``sanitize_name`` also strips ``<`` and ``>``: storing the sanitised
+    form would rewrite ordinary planning text, turning "cut p99 latency
+    to <200ms" into "...to 200ms" and inverting the constraint.  Storage
+    stays verbatim, so the model reads back what it sent through
+    ``tasks(action='list')``.
+
+    Rows that are not dicts pass through untouched — the envelope is a
+    JSON blob and ``load_task_envelope`` shape-checks only its top level.
+    """
+    rows = envelope.get("tasks")
+    if not isinstance(rows, list):
+        return envelope
+    clean: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        row = {**row, "title": sanitize_name(str(row.get("title") or ""))}
+        if "note" in row:
+            row["note"] = sanitize_name(str(row.get("note") or ""))
+        clean.append(row)
+    return {**envelope, "tasks": clean}
 
 
 # ---------------------------------------------------------------------------

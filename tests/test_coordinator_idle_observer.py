@@ -92,6 +92,9 @@ class _FakeSession:
         self._nudge_queue = NudgeQueue()
         self.messages: list[Turn] = []
         self._wake_source_tag: str = ""
+        # Set by ChatSession._drain_pending_advisories on every abandoned
+        # generation, cleared at the top of the next send().
+        self._generation_abandoned: bool = False
         self._metacog_state: dict[str, float] = {}
         self._mem_cfg = MagicMock(nudge_cooldown=300, nudges=True)
         # Tools the persona envelope hides — drives _persona_tool_visible.
@@ -1591,3 +1594,113 @@ class TestRaggedStatus:
         assert len(snap) == 1
         assert "tsk_good" in snap[0][1]
         assert "tsk_bad" not in snap[0][1]
+
+
+class TestCancelledGenerationDoesNotRearmTheWake:
+    """An abandoned turn ends in ``_emit_state("idle")``, and that IDLE
+    reaches this observer.
+
+    The cancel path demotes the queue to quiet precisely so nothing wakes
+    the coordinator the operator just stopped — but the demote runs
+    BEFORE the IDLE fans out, and the watcher is a subscriber on that
+    same fan-out, so an entry enqueued here is seen before any later
+    cleanup could reach it.  The enqueue has to be prevented.
+    """
+
+    def test_advice_does_not_fire_on_an_abandoned_generation(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("[generation cancelled before completion]")
+        ws.session._generation_abandoned = True
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(ws.session._nudge_queue) == 0
+
+    def test_liveness_still_fires_on_an_abandoned_generation(self, coord_setup):
+        """Cancelling the coordinator's turn does not cancel its
+        children — their results still need collecting, which is the
+        whole point of the liveness class."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("[generation cancelled before completion]")
+        ws.session._generation_abandoned = True
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+
+    def test_advice_resumes_after_the_next_send_clears_the_latch(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+        ws.session._generation_abandoned = True
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 0
+
+        ws.session._generation_abandoned = False  # what send() does
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+
+
+class TestUnidentifiableTasksAreNotClaimed:
+    """A body whose rows carry no usable id cannot be re-validated at
+    drain, so making the claim at all would spend the advice budget on
+    entries that are always dropped."""
+
+    def test_all_id_less_rows_do_not_enqueue(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(
+            storage,
+            {"title": "no id here", "status": "pending"},
+            {"title": "nor here", "status": "pending"},
+        )
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(ws.session._nudge_queue) == 0
+
+    def test_budget_survives_an_unidentifiable_list(self, coord_setup):
+        """The failure that made this worth a gate: without it each IDLE
+        charged a cap slot and stamped the cooldown for an entry that
+        could never be delivered."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, {"title": "no id", "status": "pending"})
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        for _ in range(3):
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        # A well-formed list now arrives; the full advice budget is intact.
+        _set_tasks(storage, _task("tsk_a", "pending"))
+        for _ in range(3):
+            ws.session._metacog_state.clear()
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 2
+
+    def test_partially_identifiable_list_still_fires(self, coord_setup):
+        mgr, storage, ws = coord_setup
+        _set_tasks(
+            storage,
+            {"title": "no id", "status": "pending"},
+            _task("tsk_real", "pending"),
+        )
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]

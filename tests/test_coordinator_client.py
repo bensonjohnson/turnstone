@@ -3007,58 +3007,45 @@ def test_legacy_task_row_without_note_round_trips(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_add_sanitises_note_and_title(tmp_path):
-    """Sanitising at the WRITE is what reaches the two surfaces the
-    operator ACTS on — the tasks sidebar and (via its own pass) the
-    approval preview.  The nudge formatter's sanitiser never sees those."""
+def test_tasks_stores_title_and_note_verbatim(tmp_path):
+    """Storage is NOT sanitised.  ``sanitize_name`` strips angle
+    brackets, so sanitising here would rewrite ordinary planning text —
+    "cut p99 latency to <200ms" would store as "...to 200ms", inverting
+    the constraint.  That is the silent mutation the reject-don't-truncate
+    rule forbids.  Sanitisation lives at each operator-facing render
+    instead."""
     client = _task_client(tmp_path)
     task = client.tasks_add(
         "coord-1",
-        title="audit <thinking>auth</thinking>",
-        note="do not ‮evorppa",
+        title="cut p99 latency to <200ms",
+        note="which of <staging|prod> is canonical?",
     )
-    assert "error" not in task
-    assert "<" not in task["title"] and ">" not in task["title"]
-    assert "‮" not in task["note"]
+    assert task["title"] == "cut p99 latency to <200ms"
+    assert task["note"] == "which of <staging|prod> is canonical?"
 
 
 def test_tasks_length_check_measures_what_the_model_sent(tmp_path):
-    """Order is load-bearing: length BEFORE sanitise.  Measuring after
-    would report a length the model never sent, so a 201-char value made
-    of strippable characters would be silently accepted — breaking the
-    reject-don't-truncate contract the cap documents."""
     client = _task_client(tmp_path)
     result = client.tasks_add("coord-1", title="a" * 201)
     assert "error" in result and "201 chars" in result["error"]
-    # 201 chars of angle brackets sanitise to "", but the model still
-    # sent 201 characters and must be told so.
-    result2 = client.tasks_add("coord-1", title="<" * 201)
-    assert "error" in result2 and "too long" in result2["error"]
 
 
-def test_tasks_add_rejects_title_that_sanitises_away(tmp_path):
-    """Emptiness is re-tested AFTER sanitising, or a title of only
-    angle brackets slips past the guard that forbids an empty one."""
+def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path):
+    """The pane's copy IS sanitised — a bidi override must not make the
+    operator read an ask in an order different from the stored one."""
+    from turnstone.console.server import _sanitize_task_envelope_for_display
+
     client = _task_client(tmp_path)
-    result = client.tasks_add("coord-1", title="<>")
-    assert "error" in result
-    assert "required" in result["error"]
+    client.tasks_add("coord-1", title="plain", note="do not \u202eevorppa")
+    envelope = client.tasks_get("coord-1")
+    shown = _sanitize_task_envelope_for_display(envelope)
+    assert "\u202e" not in shown["tasks"][0]["note"]
+    # ...and the stored copy is untouched.
+    assert "\u202e" in client.tasks_get("coord-1")["tasks"][0]["note"]
 
 
-def test_tasks_update_rejects_title_that_sanitises_away(tmp_path):
-    client = _task_client(tmp_path)
-    task = client.tasks_add("coord-1", title="real title")
-    result = client.tasks_update("coord-1", task_id=task["id"], title="<>")
-    assert "error" in result
-    assert "cannot be empty" in result["error"]
-    # The original survives the rejection.
-    assert client.tasks_get("coord-1")["tasks"][0]["title"] == "real title"
+def test_display_sanitiser_passes_ragged_rows_through(tmp_path):
+    from turnstone.console.server import _sanitize_task_envelope_for_display
 
-
-def test_tasks_update_note_that_sanitises_away_clears(tmp_path):
-    """A note of only strippable characters is the same request as an
-    empty one — it clears, and the absent-by-default shape is kept."""
-    client = _task_client(tmp_path)
-    task = client.tasks_add("coord-1", title="t", note="real note")
-    updated = client.tasks_update("coord-1", task_id=task["id"], note="<>")
-    assert "note" not in updated
+    out = _sanitize_task_envelope_for_display({"version": 1, "tasks": ["not a dict", 42]})
+    assert out["tasks"] == ["not a dict", 42]

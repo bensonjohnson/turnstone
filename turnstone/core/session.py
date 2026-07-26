@@ -1737,6 +1737,11 @@ class ChatSession:
         # correction nudges on top of it) and so the synthesized user
         # message gets stamped ``_source`` for audit / replay distinction.
         self._wake_source_tag: str = ""
+        # True between an abandoned generation (cancel / interrupt /
+        # fatal error) and the next ``send``.  Read by producers that
+        # must not treat the IDLE such a path emits as an invitation to
+        # wake the workstream back up.
+        self._generation_abandoned: bool = False
         # Nudge entries pre-drained by ``deliver_wake_nudge_from_queue``
         # — handed to ``_emit_pending_user_nudges`` so the synthesized
         # send doesn't re-drain (and so we can bail out before send when
@@ -6119,6 +6124,10 @@ class ChatSession:
             self._budget_exhausted = False
             self._budget_warned = False
         self._notify_count = 0
+        # Cleared per send: set by ``_drain_pending_advisories`` on every
+        # abandoned-generation path so the IDLE those paths emit can be
+        # told apart from an IDLE a turn reached under its own power.
+        self._generation_abandoned = False
         # Per-send cooperative-compaction latch: each send starts a fresh
         # advise→compact cycle, so reset here.  This single chokepoint covers
         # the cancel / error / superseded / resume / clear / new exits that
@@ -6853,7 +6862,19 @@ class ChatSession:
         a wake earned by a NEW event) without ever being the wake reason.
         Stale entries are handled at drain time by their ``valid_until``
         predicates.
+
+        Demoting is necessary but NOT sufficient, because the
+        ``_emit_state("idle")`` that follows fans out synchronously to
+        state subscribers — and a producer reacting to that IDLE can
+        enqueue a NEW wake-eligible entry after this demote has run,
+        re-arming the very wake the demote exists to disarm (the
+        ``IdleNudgeWatcher`` is itself a subscriber on the same fan-out,
+        so it sees the new entry before any later cleanup could reach
+        it).  The latch set here is how such producers tell this IDLE
+        apart from one a turn reached under its own power; it is cleared
+        at the top of the next ``send``.
         """
+        self._generation_abandoned = True
         self._nudge_queue.clear_channels({"tool", "user"})
         self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
