@@ -202,6 +202,19 @@ class TestScoring:
         r = score_nudge_run(log, _envelope(), case, {})
         assert not r["pass"] and "stop" in r["failures"][0]
 
+    def test_allow_after_bookkeeping_permits_escalation_surfacing(self):
+        """``notify`` after the bookkeeping is the escalation reaching
+        the operator's channel — the POINT of a legit stop, not a
+        violation of it.  Anything outside the allowlist still fails."""
+        case = {"require_stop": True, "allow_after_bookkeeping": ["notify"]}
+        ok = [
+            {"tool": "tasks", "args": {"action": "update"}, "result": "", "turn": 0},
+            {"tool": "notify", "args": {"message": "need the token"}, "result": "", "turn": 1},
+        ]
+        assert score_nudge_run(ok, _envelope(), case, {})["pass"]
+        stray = ok + [{"tool": "list_nodes", "args": {}, "result": "", "turn": 2}]
+        assert not score_nudge_run(stray, _envelope(), case, {})["pass"]
+
     def test_expected_actions_contains_any(self):
         case = {
             "expect_actions": {

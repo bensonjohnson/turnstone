@@ -62,6 +62,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
         "forbid_actions": _FORBID_DISPATCH,
         "expect_state": {0: {"status": "needs_operator", "note_nonempty": True}},
         "require_stop": True,
+        "allow_after_bookkeeping": ["notify"],
     },
     {
         "id": "C2_legit_stop_credential",
@@ -88,6 +89,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
         "forbid_actions": _FORBID_DISPATCH,
         "expect_state": {0: {"status": "needs_operator", "note_nonempty": True}},
         "require_stop": True,
+        "allow_after_bookkeeping": ["notify"],
     },
     {
         "id": "C3_premature_stop",
@@ -147,6 +149,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
         "forbid_actions": _FORBID_DISPATCH,
         "expect_state": {0: {"status": "done"}},
         "require_stop": True,
+        "allow_after_bookkeeping": ["notify"],
     },
     {
         "id": "C5_mixed_matrix",
