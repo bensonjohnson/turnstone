@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -651,10 +652,13 @@ class TestLifecycle:
 class TestIdleTasks:
     """The ``idle_tasks`` gate matrix.
 
-    The load-bearing case is ``test_active_children_suppress_idle_tasks``:
-    ``idle_children`` says "block on your children" and ``idle_tasks`` says
-    "pick your task back up".  Delivering both in one drain hands the model
-    contradictory instructions, so the pair must never co-exist.
+    The load-bearing case is ``test_active_children_co_deliver_with_
+    idle_tasks``: the classes are independent conditions, so when both
+    hold the pair CO-DELIVERS in one drain, tasks first.  Each body
+    asserts only its own domain (the tasks body carries an explicit
+    "children may still be running" line), so a consistent pair is two
+    true statements — the thing that must never happen is a STALE pair,
+    which the per-path reads and per-entry predicates prevent.
     """
 
     def test_open_tasks_and_no_children_enqueues(self, coord_setup):
@@ -680,8 +684,15 @@ class TestIdleTasks:
         # The escape hatch must be reachable from the body itself.
         assert "needs_operator" in text
 
-    def test_active_children_suppress_idle_tasks(self, coord_setup):
-        """Both conditions true → ``idle_children`` only, never the pair."""
+    def test_active_children_co_deliver_with_idle_tasks(self, coord_setup):
+        """Both conditions true → both fire, TASKS FIRST.
+
+        The order is the ruling, not an accident: the grooming
+        instruction is instant and the park instruction is open-ended,
+        so the co-delivered batch must end on the wait.  Every drain
+        path delivers in seq order, so enqueue order pins delivery
+        order.
+        """
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -692,14 +703,12 @@ class TestIdleTasks:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
-        assert types == ["idle_children"]
+        assert types == ["idle_tasks", "idle_children"]
 
-    def test_children_query_runs_once_per_idle_event(self, coord_setup):
-        """Both paths share ONE snapshot.
-
-        Two independent queries let a child finishing between them enqueue
-        ``idle_children`` (children active at T0) *and* ``idle_tasks`` (none
-        at T1) into the same drain — the contradictory pair above.
+    def test_children_query_runs_at_most_once_per_idle_event(self, coord_setup):
+        """Only the liveness path reads children now — the tasks path
+        asserts its own domain and never queries.  One IDLE event with
+        both conditions true costs exactly one ``list_workstreams``.
         """
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
@@ -878,11 +887,9 @@ class TestPerClassCaps:
         coordinator with running children must be wakeable regardless of
         how many task reminders preceded it.
 
-        Note the queue ends holding ONLY liveness entries — the first
-        liveness fire supersedes the queued advice ones, since a coord
-        with live children must not also be told to resume.  The budget
-        assertion is therefore on the count of liveness fires, not on
-        both classes coexisting.
+        The classes co-exist in the queue (co-delivery), so the ceiling
+        is a real 5: the two advice entries stay queued while liveness
+        spends its independent 3.
         """
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -904,7 +911,7 @@ class TestPerClassCaps:
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
-        assert types == ["idle_children"] * 3
+        assert types == ["idle_tasks"] * 2 + ["idle_children"] * 3
 
     def test_liveness_cap_is_three(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -1127,16 +1134,17 @@ class TestIdleTasksMetadata:
 class TestIndeterminateChildrenRead:
     """A storage failure must read as "unknown", never as "no children".
 
-    ``_active_children`` returning ``[]`` on error let the advice path's
-    falsy check pass, firing "resume your task" while children ran — the
-    contradictory pair arriving through the failure door.  The two
-    classes now map indeterminacy in opposite directions, each toward
-    its own safe side.
+    ``_active_children`` returning ``[]`` on error once collapsed an
+    indeterminate read into a real empty answer.  The LIVENESS enqueue
+    gate fails closed on ``None`` (no fire on an unknown read); the
+    advice path no longer consults children at all, so a failed
+    children read cannot perturb it in either direction.
     """
 
-    def test_advice_does_not_fire_when_children_read_fails(self, coord_setup):
-        """The bug this class exists for: the tasks path must not treat a
-        failed children query as licence to fire."""
+    def test_advice_fires_when_the_children_read_fails(self, coord_setup):
+        """The tasks path asserts only its own domain — a failed
+        CHILDREN query is irrelevant to it, and its body's "children may
+        still be running" line is what keeps advice-alone honest here."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -1147,7 +1155,8 @@ class TestIndeterminateChildrenRead:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert len(ws.session._nudge_queue) == 0
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_tasks"]
 
     def test_liveness_does_not_fire_when_children_read_fails(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -1161,28 +1170,30 @@ class TestIndeterminateChildrenRead:
 
         assert len(ws.session._nudge_queue) == 0
 
-    def test_failed_children_read_is_memoised(self, coord_setup):
-        """``None`` is a real snapshot value, so it must memoise like any
-        other.  Re-running the query would let a first-raise /
-        second-success pair hand the two paths different answers — the
-        same contradictory pair the shared snapshot prevents.
-        """
+    def test_children_query_skipped_when_liveness_gates_short_circuit(self, coord_setup):
+        """The laziness ruling, pinned: the children query sits AFTER
+        the liveness path's cheap gates, so an IDLE event where liveness
+        is cooldown-blocked costs ZERO ``list_workstreams`` round-trips
+        even while the advice path fires."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
-        storage.list_raises = True
+        ws.session._metacog_state["idle_children"] = time.time()  # inside cooldown
 
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert len(storage.list_calls) == 1
+        assert len(storage.list_calls) == 0
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_tasks"]
 
     def test_ragged_child_row_is_indeterminate_not_empty(self, coord_setup):
         """A row missing ``state`` used to raise KeyError outside the
         try, killing both paths with a traceback.  It must degrade to
-        "unknown" — which still fires nothing, but by the designed
-        route."""
+        "unknown": the LIVENESS path fires nothing (fail closed at
+        enqueue), by the designed route — and the tasks path, which
+        reads no children, is unperturbed."""
         mgr, storage, ws = coord_setup
         storage.children.append({"ws_id": "child-x", "name": "ragged"})  # no state
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -1192,19 +1203,24 @@ class TestIndeterminateChildrenRead:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert len(ws.session._nudge_queue) == 0
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_tasks"]
 
 
 class TestAdviceDrainPredicate:
-    """The advice predicate re-checks BOTH halves of its enqueue
-    condition across the entry's queued lifetime, not just at enqueue.
+    """The advice predicate re-validates ONLY what the body asserts:
+    that at least one task the body NAMES is still open.  It reads no
+    children state — each nudge asserts its own domain, and the body's
+    "children may still be running" line is what keeps a delivery
+    beside live children honest.
     """
 
-    def test_dropped_when_children_appear_before_drain(self, coord_setup):
-        """The queued-lifetime hole: a coord can spawn children between
-        enqueue and drain (a worker owns the ws, or a cancel demoted the
-        entry), and delivering "resume your task" beside live children is
-        the contradictory pair."""
+    def test_delivered_when_children_appear_before_drain(self, coord_setup):
+        """Children spawning during the entry's queued lifetime do not
+        invalidate it: the body's claim is about TASKS, and it remains
+        true.  (The old cross-domain drop here was the enforcement arm
+        of the exclusivity design; its deletion is the deletion of the
+        REQUIREMENT, not of a still-needed derivation.)"""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -1215,9 +1231,12 @@ class TestAdviceDrainPredicate:
         assert len(ws.session._nudge_queue) == 1
 
         _add_active_child(storage, ws_id="child-late", state="running")
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_tasks"]
 
-    def test_dropped_when_children_read_fails_at_drain(self, coord_setup):
+    def test_children_read_failure_is_irrelevant_to_the_advice_predicate(self, coord_setup):
+        """The cross-domain failure-direction coupling is gone: a failed
+        CHILDREN read can neither deliver nor drop a tasks entry."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -1227,7 +1246,8 @@ class TestAdviceDrainPredicate:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         storage.count_raises = True
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_tasks"]
 
     def test_dropped_when_the_named_tasks_all_resolved(self, coord_setup):
         """ "Some task is open" is not licence to deliver a body naming
@@ -1311,21 +1331,25 @@ class TestRaggedTaskRows:
         assert "42" in snap[0][1]
 
 
-class TestAdvicePredicateIsLoadBearing:
-    """The advice predicate's children half cannot be replaced by the
-    enqueue-time supersede.
+class TestAdviceIsIndependentOfLiveness:
+    """Advice-alone beside live children is REACHABLE BY DESIGN.
 
-    A supersede fires only when the sibling actually ENQUEUES — the
-    ``if idle_children_fired`` shape gate 2 forbids.  These are the
-    reachable windows where the children condition changes with NO
-    liveness enqueue, so only the drain-time check catches the stale
-    entry.  If a future edit deletes that check in favour of the
-    supersede, these fail.
+    These are the D2 states: the liveness nudge blocked by its own wait
+    gate or cooldown while a queued advice entry survives and delivers
+    beside running children.  The operator ruled them acceptable, with
+    the containment living in the BODY (the "children may still be
+    running" line plus the blocked-on-child branch), not in a
+    cross-domain gate.  Pinning them keeps the exposure explicit in the
+    suite rather than silent — and if evals show small models fumbling
+    these deliveries, the named upgrade path is a combined checkpoint
+    type, not a re-introduced children check.
     """
 
-    def test_stale_when_liveness_blocked_by_its_wait_tool_gate(self, coord_setup):
-        """The counterexample that invalidated the first version of this
-        redesign: no failure, no race, entirely by design."""
+    def test_advice_delivers_while_liveness_is_blocked_by_the_wait_gate(self, coord_setup):
+        """Was the counterexample that invalidated the exclusivity
+        design's supersede; under co-delivery it is the intended
+        behaviour: the entry's task claim is still true, so it
+        delivers."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -1336,8 +1360,8 @@ class TestAdvicePredicateIsLoadBearing:
         assert len(ws.session._nudge_queue) == 1
 
         # The coord spawns children and calls wait_for_workstream, so
-        # _maybe_enqueue_children returns at its wait-tool gate and never
-        # enqueues — nothing supersedes the queued advice entry.
+        # BOTH paths return at their wait-tool gates on the next IDLE —
+        # no new entry, and the queued advice entry is untouched.
         _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns(
             "waiting on the children", tools=["wait_for_workstream"]
@@ -1346,13 +1370,13 @@ class TestAdvicePredicateIsLoadBearing:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
 
-        # Only the drain-time children check can catch this.
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_tasks"]
 
-    def test_stale_when_liveness_blocked_by_its_own_cooldown(self, coord_setup):
-        """Second window with no liveness enqueue: the per-type cooldowns
-        are independent, so liveness can be inside its 300s window while
-        advice fires and children appear."""
+    def test_advice_delivers_while_liveness_is_inside_its_cooldown(self, coord_setup):
+        """The per-type cooldowns are independent, so liveness can be
+        inside its 300s window while an advice entry queues and then
+        delivers beside returned children."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")
@@ -1370,32 +1394,42 @@ class TestAdvicePredicateIsLoadBearing:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
 
-        # Children come back, but liveness is still cooling down — no
-        # enqueue, so no supersede.  Only the predicate catches it.
+        # Children come back while liveness is still cooling — the
+        # queued advice entry survives and DELIVERS: its task claim is
+        # true, and the children's return does not falsify it.
         _add_active_child(storage, ws_id="child-b", state="running")
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_tasks"]
 
 
 class TestDrainChildrenMemo:
-    """Both predicates read ONE memoised children answer.
+    """Every queued LIVENESS entry in one drain pass reads ONE memoised
+    children answer.
 
-    Two unmemoised reads can disagree inside a single drain pass, and
-    because the classes map an indeterminate read in OPPOSITE directions
-    (liveness delivers, advice drops) a disagreement is exactly how both
-    nudges reach one turn.
+    Up to the per-type cap of liveness entries can sit queued at once,
+    and ``drain_entries`` evaluates each ``valid_until`` independently —
+    unmemoised, entry 1 could deliver on a raise (fail-open) while entry
+    2's read succeeds and drops microseconds later: one stale body
+    delivered beside one silently dropped.  One observation per pass
+    keeps same-class entries coherent, and N entries cost one query.
     """
 
-    def test_one_query_serves_both_predicates_in_a_drain(self, coord_setup):
+    def test_one_query_serves_every_queued_liveness_entry_in_a_drain(self, coord_setup):
         mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")
         observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        for _ in range(3):  # queue the full liveness budget
+            ws.session._metacog_state.clear()
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 3
 
         before = len(storage.count_calls)
-        a = observer._children_state_at_drain(ws.id, ws.user_id)
-        b = observer._children_state_at_drain(ws.id, ws.user_id)
-        assert a == b
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_children"] * 3
         assert len(storage.count_calls) - before == 1
 
     def test_memo_caches_the_indeterminate_answer_too(self, coord_setup):
@@ -1413,11 +1447,18 @@ class TestDrainChildrenMemo:
         assert len(storage.count_calls) == before
 
 
-class TestSupersede:
-    """Enqueueing one class drops the queued sibling — defence in depth
-    on top of the drain predicates, never a replacement for them."""
+class TestCoDelivery:
+    """Both classes co-exist in one queue and co-deliver in one drain.
 
-    def test_liveness_supersedes_queued_advice(self, coord_setup):
+    The supersede is gone WITH the exclusivity requirement it enforced —
+    each entry asserts only its own domain, so a consistent pair is two
+    true statements.  These pin that nothing drops, demotes, or reorders
+    a sibling."""
+
+    def test_liveness_and_advice_coexist_in_one_queue(self, coord_setup):
+        """Cross-bracket accumulation: an advice entry from bracket N
+        and a liveness entry from bracket N+1 both survive.  Seq order
+        here is tasks-first because tasks enqueued first."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -1427,33 +1468,19 @@ class TestSupersede:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
 
+        # No cooldown reset: the tasks stamp keeps advice quiet in
+        # bracket 2 (its claim is already queued), and liveness has no
+        # stamp yet, so exactly one entry of each accumulates.
         _add_active_child(storage, ws_id="child-a", state="running")
-        ws.session._metacog_state.clear()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_tasks", "idle_children"]
 
-    def test_advice_supersedes_queued_liveness(self, coord_setup):
-        mgr, storage, ws = coord_setup
-        _add_active_child(storage, ws_id="child-a", state="running")
-        ws.session.messages = _assistant_turns("ok")
-
-        observer = CoordinatorIdleObserver(mgr, storage)
-        observer.start()
-        mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
-
-        storage.children.clear()
-        _set_tasks(storage, _task("tsk_a", "in_progress"))
-        ws.session._metacog_state.clear()
-        mgr.fire_state(ws.id, WorkstreamState.IDLE)
-
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
-
-    def test_supersede_reaches_demoted_quiet_entries(self, coord_setup):
-        """An operator Stop demotes queued entries from "any" to "quiet".
-        A channel-filtered drop would miss exactly those, leaving the
-        pair assembled."""
+    def test_co_delivery_survives_a_stop_demotion(self, coord_setup):
+        """An operator Stop demotes queued entries from "any" to
+        "quiet"; a later liveness fire must not disturb them — the
+        demoted advice entry rides the next legitimate seam."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -1463,15 +1490,19 @@ class TestSupersede:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         ws.session._nudge_queue.demote_channel("any", "quiet")
 
+        # Tasks stays inside its own cooldown; only liveness fires.
         _add_active_child(storage, ws_id="child-a", state="running")
-        ws.session._metacog_state.clear()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending()] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending()] == [
+            "idle_tasks",
+            "idle_children",
+        ]
 
-    def test_refused_fire_does_not_supersede(self, coord_setup):
-        """The drop sits after the charge.  A fire refused by the cap
-        must not delete a liveness wake it does not replace."""
+    def test_refused_fire_does_not_disturb_the_sibling(self, coord_setup):
+        """Cap-refused advice fires leave queued liveness entries
+        untouched (and vice versa) — regression guard against any future
+        re-introduction of cross-type dropping."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")
@@ -1481,14 +1512,74 @@ class TestSupersede:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert len(ws.session._nudge_queue) == 1
 
-        # Exhaust the advice budget against a condition that cannot fire
-        # (children are live), then confirm the liveness entry survives.
+        # Fire past the advice cap; the liveness entry must survive and
+        # the advice count must stop at its own budget.
         storage.children.clear()
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         for _ in range(3):
             ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.count_by_type("idle_tasks") <= 2
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_children"] + ["idle_tasks"] * 2
+
+    def test_both_types_drain_in_seq_order(self, coord_setup):
+        """One IDLE event, both conditions → one drain delivers both,
+        tasks first.  This is the B5 ordering ruling crossing the queue:
+        every drain path delivers by seq, so enqueue order IS delivery
+        order."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        drained = ws.session._nudge_queue.drain({"any"})
+        assert [d[0] for d in drained] == ["idle_tasks", "idle_children"]
+
+
+class TestParkGates:
+    """Park signals gate BOTH nudge paths; domain conditions gate only
+    their own.  A coord parked on a known wake source (a wait call, an
+    operator question) must not be woken to groom tasks — but the
+    question heuristic must NEVER silence the liveness wake, because
+    nothing else wakes a coordinator whose children finish (child
+    completion events fan out to the browser SSE only)."""
+
+    def test_liveness_still_fires_when_the_last_turn_asked_the_operator(self, coord_setup):
+        """The D1 ruling: symmetrising the asked-operator gate onto the
+        children path would strand a coord that ends "shall I proceed?"
+        while three children run — permanently, since no other wake
+        exists.  The asymmetry is the load-bearing safety property."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("Which backend should I use?")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_children"]
+
+    def test_advice_skipped_when_the_last_turn_used_the_wait_tool(self, coord_setup):
+        """The tasks-path wait gate.  Nearly inert at a natural
+        end-of-turn IDLE; its non-redundant coverage is a session
+        rehydrated mid-wait, which this constructs."""
+        mgr, storage, ws = coord_setup
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns(
+            "waiting on the children", tools=["wait_for_workstream"]
+        )
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(ws.session._nudge_queue) == 0
 
 
 class TestAssertedSet:

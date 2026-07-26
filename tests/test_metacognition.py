@@ -595,10 +595,11 @@ class TestSanitizePayload:
 class TestFormatIdleTasksNudge:
     """The ``idle_tasks`` body.
 
-    Three properties are asserted deliberately rather than incidentally:
-    the message declares it is not the operator speaking, the
-    operator-escalation branch precedes the resume branch, and both
-    model-authored fields are sanitised.
+    Four properties are asserted deliberately rather than incidentally:
+    the message declares it is not the operator speaking, the escape
+    branches (operator, blocked-on-child) precede the resume branch,
+    both model-authored fields are sanitised, and the body never
+    asserts the children are done.
     """
 
     def _task(self, task_id="tsk_a", status="pending", title="do the thing", **extra):
@@ -644,6 +645,26 @@ class TestFormatIdleTasksNudge:
         out = self._fmt([self._task()])
         assert "status='done'" in out
         assert out.index("needs_operator") < out.index("status='done'")
+
+    def test_blocked_on_child_branch_sits_between_escape_and_resume(self):
+        """Branch order follows harm: guessing on an operator decision >
+        redoing a running child's work > a stale list > redone finished
+        work.  The blocked-on-child branch is the second escape hatch —
+        after the operator one, before "take it"."""
+        out = self._fmt([self._task()])
+        assert "child_ws_id='ws_...'" in out
+        assert "wait_for_workstream" in out
+        assert out.index("needs_operator") < out.index("child_ws_id='ws_...'")
+        assert out.index("child_ws_id='ws_...'") < out.index("If the next step is yours")
+
+    def test_never_asserts_children_are_done(self):
+        """This nudge can fire ALONE while children run (the liveness
+        nudge can be blocked by its own cooldown/cap/wait gate), so the
+        body must carry the may-still-be-running line — deleting it
+        reopens the resume-over-live-children hazard the old
+        cross-domain fire gate existed for."""
+        out = self._fmt([self._task()])
+        assert "may still be running" in out
 
     def test_note_renders_when_present(self):
         out = self._fmt([self._task(note="which backend is canonical?")])

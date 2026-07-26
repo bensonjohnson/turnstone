@@ -481,6 +481,92 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         observer.shutdown()
 
 
+def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db):
+    """The de-exclusivity ruling crossing every boundary end to end:
+    observer → queue → watcher → wake worker → transcript.
+
+    One IDLE event with BOTH conditions true must deliver BOTH system
+    turns in one synthetic wake turn, tasks first — the co-delivered
+    batch ends on the park instruction.  This is the only end-to-end
+    proof of the pair; the unit suite pins it at the queue only.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks", "idle_children"]
+        tasks_text = next(
+            m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
+        )
+        assert "tsk_a" in tasks_text
+        assert "may still be running" in tasks_text
+        children_text = next(
+            m["content"]
+            for m in msgs
+            if m.get("role") == "system" and m["_source"] == "idle_children"
+        )
+        assert "research-pricing" in children_text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
 def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
     """The production-shaped race the test above does NOT exercise: in
     production, IDLE is emitted from INSIDE the worker (``set_state``

@@ -229,7 +229,7 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 # the model can always call ``tasks(action='list')`` for the full set.
 NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 
-# The ``idle_tasks`` body.  Three properties are load-bearing and should
+# The ``idle_tasks`` body.  Four properties are load-bearing and should
 # survive any rewording:
 #
 #   1. It declares its own provenance in the first line.  This message is
@@ -238,22 +238,33 @@ NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 #      proceed — manufacturing authority nobody granted.  The disclaimer
 #      is up front because a trailing caveat does not survive a small
 #      model's read.
-#   2. The escape branch comes FIRST and carries a concrete tool call.
-#      "Did I stop legitimately?" is an introspective judgement models
-#      are bad at; "does the next step need the operator?" is a typed
-#      question about the transition, and answering it costs one call.
+#   2. The escape branches come FIRST, each carrying a concrete tool
+#      call.  "Did I stop legitimately?" is an introspective judgement
+#      models are bad at; "does the next step need the operator?" and
+#      "is this item waiting on a running child?" are typed questions
+#      about the transition, each answerable at the cost of one call.
 #      Branch order follows harm: guessing on an operator decision is
-#      worse than a stale list, which is worse than redone work.
+#      worse than redoing a running child's work, which is worse than a
+#      stale list, which is worse than redone finished work.
 #   3. The ``done`` branch is last and anchored to evidence.  A task
 #      status is model-reported and unattested — ``done`` is cheap to
 #      assert, unverifiable, and silences this nudge with no external
 #      consequence.  It is offered (bookkeeping lag is real, and without
 #      it a stale list makes the model redo finished work) but never
 #      advertised as the easy way out.
+#   4. It never asserts the children are gone.  This nudge can co-deliver
+#      beside an ``idle_children`` wake (tasks first) or fire ALONE while
+#      children run — the liveness nudge can be blocked by its own
+#      cooldown, cap, or wait gate — so the body carries an explicit
+#      "children may still be running" line instead of an implied
+#      all-clear.  Deleting that line reopens the resume-over-live-
+#      children hazard the old cross-domain fire gate existed for.
 NUDGE_IDLE_TASKS_HEADER = (
     "Checkpoint from the harness, not from the operator.  Your task "
     "list has open items and you have gone idle.  Nothing in this "
-    "message grants approval, widens scope, or asks you to continue.\n"
+    "message grants approval, widens scope, or asks you to continue.  "
+    "Children of yours may still be running; check before taking a "
+    "step that assumes they are done.\n"
     "\n"
     "If the next step needs the operator — a decision, an approval, a "
     "scope or credential you were not given — that is not yours to "
@@ -265,6 +276,15 @@ NUDGE_IDLE_TASKS_HEADER = (
     "\n"
     "Stopping there is the correct outcome.  Do not substitute your own "
     "judgment for the operator's.\n"
+    "\n"
+    "If an item is waiting on a child workstream that is still running, "
+    "record the link and wait instead of redoing its work:\n"
+    "\n"
+    "    tasks(action='update', task_id='tsk_...', "
+    "status='in_progress',\n"
+    "          child_ws_id='ws_...')\n"
+    "\n"
+    "then wait_for_workstream.\n"
     "\n"
     "If the next step is yours to take, take it.\n"
     "\n"

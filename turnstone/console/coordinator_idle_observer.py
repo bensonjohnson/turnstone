@@ -14,9 +14,25 @@ Two nudge types, in two different **classes**:
   interactive children; the wake exists so their results are collected
   instead of abandoned.  Suggests ``wait_for_workstream``.
 * ``idle_tasks`` — ADVICE.  The coord went idle holding open
-  (``pending`` / ``in_progress``) entries on its own ``tasks`` list and
-  *no* active children.  Suggests reconciling the list, with the
-  operator-escalation branch first.
+  (``pending`` / ``in_progress``) entries on its own ``tasks`` list.
+  Suggests reconciling the list, with the operator-escalation branch
+  first.
+
+The classes are INDEPENDENT: both conditions can hold in one IDLE
+event, and both nudges then fire and CO-DELIVER in one drain, tasks
+first — the grooming instruction is instant, the park instruction is
+open-ended, so the batch ends on the wait.  Each nudge asserts only its
+own domain: the tasks body never claims the children are gone (it
+carries an explicit "children may still be running" line, because the
+liveness nudge can be blocked by its own cooldown/cap/wait gate while
+advice fires alone), so a consistent pair is two true statements, not a
+contradiction.  One ordering caveat, accepted: a cross-bracket pair (an
+older queued ``idle_children`` surviving into a bracket that enqueues
+``idle_tasks``) delivers children-first by seq; both entries are still
+predicate-valid, so that is a tuning miss, not a correctness one.  If
+evals show small models fumbling even the ordered pair, the named
+upgrade path is a single combined checkpoint type selected at produce
+time — do NOT reintroduce a cross-domain fire gate.
 
 The class decides three behaviours, each ruled at its site:
 
@@ -28,26 +44,32 @@ The class decides three behaviours, each ruled at its site:
   the nudge when the persona envelope hides the ``tasks`` tool its body
   instructs (``NUDGE_REQUIRED_TOOL``).
 * **Per-type caps** (:data:`_NUDGE_TYPE_CAPS`) — liveness 3, advice 2
-  per idle bracket; worst-case ceiling 5.
-* **Drain-predicate failure direction.**  An indeterminate children
-  read at drain time DELIVERS a liveness entry (stale noise is cheap;
-  a lost wake is a stall) and DROPS an advice entry (resuming over live
-  children is the contradictory pair this module exists to prevent).
-
-Mutual exclusion: the two conditions cannot both hold in one IDLE event
-("block on your children" and "resume your task" are contradictory
-instructions), enforced by a **single shared children snapshot** per
-event and re-checked by the advice drain predicate across the entry's
-whole queued lifetime.
+  per idle bracket; worst-case ceiling 5, and with both classes able to
+  fire in one bracket a single drain can deliver up to 5 bodies.
+* **Drain-predicate scope and failure direction.**  Each predicate
+  re-validates ONLY its own assertion.  An indeterminate children read
+  at drain DELIVERS a liveness entry (stale noise is cheap; a lost wake
+  is a stall) — at ENQUEUE the same class fails closed.  The advice
+  predicate never reads children at all: it drops iff no task the body
+  names is still open, or the envelope cannot be read (ADVICE fails
+  closed).
 
 Gate order, ``idle_children`` (cheap → expensive; matches the code):
 coordinator-kind → cooldown peek → cap peek → wait-tool skip →
-children snapshot → ``should_nudge`` → atomic charge → enqueue.
+children query (``None``/``[]`` → no fire) → ``should_nudge`` →
+atomic charge → enqueue.
 
-Gate order, ``idle_tasks``: coordinator-kind → ``_nudges_enabled``
-(config + ``tasks``-tool visibility) → cooldown peek → cap peek →
-asked-operator skip → children snapshot (must be a known-empty read) →
-envelope read → ``should_nudge`` → atomic charge → enqueue.
+Gate order, ``idle_tasks``: coordinator-kind → operator-Stop gate
+(``_generation_abandoned``) → ``_nudges_enabled`` (config +
+``tasks``-tool visibility) → cooldown peek → cap peek →
+asked-operator skip → wait-tool skip → envelope read →
+unidentifiable-set refusal (``bound_open_ids``) → ``should_nudge`` →
+atomic charge → enqueue.
+
+``_on_idle`` runs the tasks path BEFORE the children path so a
+same-event pair carries ascending seq in tasks-first order — every
+drain path delivers in seq order, which is what makes the ordering
+ruling hold with no queue changes.
 
 Caps reset when the ws leaves IDLE for a non-wake reason (tracked by
 ``ChatSession._wake_source_tag``); cooldowns live per-type in the
@@ -111,12 +133,13 @@ _ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
 # the liveness budget, so a coordinator that used its wakes on task
 # reminders reaches the silent-stall state (live children, no wake
 # left) strictly sooner than before ``idle_tasks`` existed.  The
-# liveness budget must be starvation-proof against advice.  The cost is
-# a higher combined ceiling (5, was 3) — acceptable because the two
-# conditions are mutually exclusive per event, so alternating fires
-# require the coordinator to actually progress (children finishing,
-# tasks reconciling) between wakes, which is the system working, not
-# hammering.
+# liveness budget must be starvation-proof against advice.  The classes
+# are independent conditions and both can fire in one bracket, so the
+# ceiling is a real 5 — and with co-delivery one drain can carry up to 5
+# bodies (roughly 3-4 KB of system-reminder text).  Accepted: the caps
+# and the per-type 300s cooldowns bound it, and a bracket only
+# accumulates entries while the coordinator keeps going idle without
+# real operator input, which is itself the signal the nudges exist for.
 #
 # Every nudge type this observer emits MUST be registered here — the
 # lookup KeyErrors on an unregistered type (surfacing via _on_state's
@@ -130,19 +153,6 @@ _NUDGE_TYPE_CAPS: dict[str, int] = {
     "idle_tasks": 2,
 }
 
-# The other class's nudge type.  The two conditions are mutually
-# exclusive, so a queued sibling is stale the moment this class fires,
-# and shipping both in one drain hands the model contradictory
-# instructions.  Superseding at enqueue is DEFENCE IN DEPTH ONLY — the
-# authoritative guard is each drain predicate's own condition check,
-# because a supersede fires only when this class actually enqueues and
-# there are reachable windows where the sibling's condition changes with
-# no enqueue at all (the wait-tool gate, its cooldown, its cap).
-_SIBLING_NUDGE_TYPE: dict[str, str] = {
-    "idle_children": "idle_tasks",
-    "idle_tasks": "idle_children",
-}
-
 # Soft cap on the snapshot query.  Higher than ``WAIT_MAX_WS_IDS`` so
 # the SQL ``LIMIT`` (applied before the Python state filter) doesn't
 # clip genuinely-active children whose ``updated`` timestamp is older
@@ -153,19 +163,18 @@ _ACTIVE_CHILDREN_QUERY_LIMIT = 200
 
 # TTL (seconds) on the drain-time children answer.
 #
-# BOTH drain predicates read the children state through one memoised
-# call, and this is why.  ``NudgeQueue.drain_entries`` evaluates each
-# entry's ``valid_until`` independently, so two unmemoised reads
-# microseconds apart can disagree — the liveness read raising (→ deliver,
-# fail-open) while the advice read succeeds and sees no children (→
-# deliver) puts BOTH nudges in one turn, which is the contradictory pair
-# this module exists to prevent.  Memoising makes the two predicates
-# answer from the same observation, so their deliberately-opposite
-# failure directions stay consistent instead of combining.
+# The LIVENESS predicate reads the children state through one memoised
+# call.  Up to the per-type cap of liveness entries can sit queued at
+# once, and ``NudgeQueue.drain_entries`` evaluates each ``valid_until``
+# independently — unmemoised, two reads microseconds apart can disagree
+# (one raising → deliver, fail-open; the next succeeding → drop), which
+# delivers one stale "children still running" body while silently
+# dropping its same-class sibling.  One observation per drain pass keeps
+# same-class entries coherent, and N queued entries cost one query, not
+# N.
 #
-# One second is long enough to span a single ``drain_entries`` loop (both
-# predicates run on the same thread, back to back) and short enough that
-# no entry is judged on a meaningfully stale view.
+# One second is long enough to span a single ``drain_entries`` loop and
+# short enough that no entry is judged on a meaningfully stale view.
 _DRAIN_CHILDREN_TTL_SECONDS = 1.0
 
 
@@ -191,7 +200,8 @@ class CoordinatorIdleObserver:
         self._fire_counts: dict[str, dict[str, int]] = {}
         self._fire_counts_lock = threading.Lock()
         # Drain-time children answers, ``ws_id -> (monotonic_stamp, answer)``.
-        # Shared by both classes' predicates so they cannot disagree — see
+        # Read by the liveness predicate so same-class entries in one
+        # drain pass cannot disagree — see
         # :data:`_DRAIN_CHILDREN_TTL_SECONDS`.  Pruned on write, so it holds
         # at most the coords drained within the last TTL.
         self._drain_children: dict[str, tuple[float, bool | None]] = {}
@@ -247,52 +257,29 @@ class CoordinatorIdleObserver:
     def _on_idle(self, ws_id: str) -> None:
         """Dispatch both nudge paths for one IDLE event.
 
-        Both paths consume the same children snapshot, computed **at
-        most once per event** and memoised behind an EMPTY single-slot
-        list — never behind ``None``, because an indeterminate read IS
-        ``None`` and must memoise too.  Using ``None`` as the
-        not-yet-computed marker would re-run the query after a storage
-        failure and could hand the two paths different answers.
+        ``idle_tasks`` runs FIRST so a same-event pair enqueues in
+        tasks-then-children seq order — every drain path delivers by
+        seq, and the co-delivered batch should END on the open-ended
+        park instruction, not start with it (module docstring).
 
-        Laziness is not an optimisation detail here, it is the gate
-        order: each path checks its cooldown and cap first (microsecond
-        dict lookups) and most IDLE events short-circuit there.
-        Computing the snapshot eagerly would put a ``list_workstreams``
-        round-trip on every coord state transition in the cluster.
-
-        Sharing is not an optimisation at all — it is correctness.  Two
-        independent ``_active_children`` calls observe two different
-        snapshots, and a child that finishes between them yields
-        ``idle_children`` (children active at T0) *and* ``idle_tasks``
-        (no children at T1) in the same drain: the model is told to
-        block on its children and to resume its task, in one turn.
+        The children query lives INSIDE the children path, after its
+        cheap gates: most IDLE events short-circuit on cooldown/cap
+        (microsecond dict lookups), and computing it eagerly here would
+        put a ``list_workstreams`` round-trip on every coord state
+        transition in the cluster.  The tasks path does not read
+        children at all — each nudge asserts only its own domain.
         """
         ws = self._manager.get(ws_id)
         if ws is None or ws.session is None:
             return
         if ws.kind is not WorkstreamKind.COORDINATOR:
             return
-        # Bind the non-Optional session for the closures below — mypy's
-        # narrowing from the check above does not reach into them.
+        # Bind the non-Optional session — mypy's narrowing from the
+        # check above does not reach into the paths' closures.
         session = ws.session
 
-        # Single-slot list as the memo: EMPTY means "not computed yet",
-        # so the slot's value is free to be ``None`` (an indeterminate
-        # read) without colliding with the sentinel.  Using ``None``
-        # itself as the sentinel would re-run the query on every access
-        # after a storage failure, and a first-raise/second-success pair
-        # would hand the two nudge paths different snapshots — exactly
-        # the contradictory-pair race this shared snapshot prevents,
-        # arriving through the failure door.
-        memo: list[list[dict[str, str]] | None] = []
-
-        def active_children() -> list[dict[str, str]] | None:
-            if not memo:
-                memo.append(self._active_children(ws))
-            return memo[0]
-
-        self._maybe_enqueue_children(ws, session, active_children)
-        self._maybe_enqueue_tasks(ws, session, active_children)
+        self._maybe_enqueue_tasks(ws, session)
+        self._maybe_enqueue_children(ws, session)
 
     # ------------------------------------------------------------------
     # shared gate head / enqueue tail
@@ -354,25 +341,6 @@ class CoordinatorIdleObserver:
         if not self._try_charge(ws_id, nudge_type):
             return False
 
-        # Supersede any queued sibling — AFTER the charge (so a refused
-        # fire can never delete a wake it does not replace) and BEFORE
-        # the enqueue (so no drain can observe both).  ``channel=None``
-        # is required: a Stop demotes queued entries from "any" to
-        # "quiet", and a channel-filtered drop would miss exactly those.
-        # Loop because a class may hold up to its per-type cap.
-        sibling = _SIBLING_NUDGE_TYPE.get(nudge_type)
-        if sibling is not None:
-            dropped = 0
-            while session._nudge_queue.drop_oldest_by_type(sibling, None):
-                dropped += 1
-            if dropped:
-                log.debug(
-                    "coord_idle_observer.superseded ws=%s dropped=%d type=%s",
-                    ws_id[:8],
-                    dropped,
-                    sibling,
-                )
-
         session._nudge_queue.enqueue(
             nudge_type,
             text,
@@ -386,12 +354,7 @@ class CoordinatorIdleObserver:
     # idle_children — LIVENESS
     # ------------------------------------------------------------------
 
-    def _maybe_enqueue_children(
-        self,
-        ws: Workstream,
-        session: ChatSession,
-        active_children: Callable[[], list[dict[str, str]] | None],
-    ) -> None:
+    def _maybe_enqueue_children(self, ws: Workstream, session: ChatSession) -> None:
         """Enqueue ``idle_children`` when the coord went idle with
         active interactive children.
 
@@ -412,8 +375,10 @@ class CoordinatorIdleObserver:
         point — the model can also continue the user's work, inspect or
         message the children — and the tool line is decoration.  This
         asymmetry with the advice path (which IS visibility-gated) is
-        deliberate: an advice body is nothing but ``tasks(...)`` calls,
-        while the liveness body has a non-tool branch.
+        deliberate: every ACTIONABLE call in the advice body is a
+        ``tasks(...)`` call (its ``wait_for_workstream`` mention is the
+        same decoration this body carries), while the liveness body has
+        a non-tool branch.
         """
         ws_id = ws.id
 
@@ -427,11 +392,11 @@ class CoordinatorIdleObserver:
         if self._last_assistant_used_wait(session):
             return
 
-        # Gate: the shared per-event children snapshot.  ``None`` means
-        # the read was indeterminate (storage raised) — fail closed and
-        # say so, rather than letting a falsy non-answer read as "no
-        # children".  ``[]`` is a REAL empty answer and also skips.
-        active = active_children()
+        # Gate: the children query.  ``None`` means the read was
+        # indeterminate (storage raised) — fail closed and say so,
+        # rather than letting a falsy non-answer read as "no children".
+        # ``[]`` is a REAL empty answer and also skips.
+        active = self._active_children(ws)
         if active is None:
             log.debug("coord_idle_observer.children_indeterminate ws=%s (no nudge)", ws_id[:8])
             return
@@ -472,10 +437,10 @@ class CoordinatorIdleObserver:
                 # prevent, with no retry behind it.  Delivering on an
                 # indeterminate read risks only a stale "children still
                 # running" nudge; if they finished, the suggested wait
-                # returns immediately with their results.  The advice
-                # predicate makes the OPPOSITE choice — see
-                # ``_maybe_enqueue_tasks`` — because its failure harm
-                # points the other way.
+                # returns immediately with their results.  The ENQUEUE
+                # gate for this same class fails the other way (no fire
+                # on an unknown read) — a queued entry represents an
+                # already-charged fire, so the drop would waste it.
                 return True
             return now
 
@@ -498,14 +463,17 @@ class CoordinatorIdleObserver:
     # idle_tasks — ADVICE
     # ------------------------------------------------------------------
 
-    def _maybe_enqueue_tasks(
-        self,
-        ws: Workstream,
-        session: ChatSession,
-        active_children: Callable[[], list[dict[str, str]] | None],
-    ) -> None:
+    def _maybe_enqueue_tasks(self, ws: Workstream, session: ChatSession) -> None:
         """Enqueue ``idle_tasks`` when the coord went idle holding open
-        tasks and (provably) no active children.
+        tasks.
+
+        Fires INDEPENDENTLY of the children state — beside a same-event
+        ``idle_children`` (co-delivery, tasks first) or alone while
+        children run and the liveness nudge is blocked by its own
+        cooldown/cap/wait gate.  The body never presumes the children
+        are done (its "children may still be running" line plus the
+        blocked-on-child branch are what make advice-alone honest), so
+        this path reads no children state at enqueue OR at drain.
 
         ADVICE class — gated on ``ChatSession._nudges_enabled``, which
         for this type means the ``memory.nudges`` config switch AND the
@@ -547,22 +515,16 @@ class CoordinatorIdleObserver:
         if self._last_assistant_asked_operator(session):
             return
 
-        # Gate: yield to ``idle_children``.  Two rulings live here:
-        #
-        # 1. The yield is to the CONDITION (children are active), not to
-        #    whether ``idle_children`` actually fired — that nudge can be
-        #    blocked by its own cooldown or cap while children are still
-        #    running, and in that window ``idle_tasks`` must stay silent
-        #    too.  "Block on your children" and "resume your task" are
-        #    contradictory instructions; the model must never receive
-        #    both in one drain.  Do NOT "fix" this into
-        #    ``if idle_children_fired``.
-        # 2. ``None`` (the read was indeterminate) yields exactly like
-        #    "children active": firing the resume-your-task nudge when
-        #    the children state is UNKNOWN risks the same contradictory
-        #    pair through the failure door.  ADVICE fails closed.
-        active = active_children()
-        if active is None or active:
+        # Gate: the coord's last assistant turn already used
+        # ``wait_for_workstream`` — it parked on a known wake source,
+        # and waking it to groom tasks defeats the park.  Park signals
+        # gate BOTH nudge paths; domain conditions gate only their own.
+        # Nearly inert at a natural end-of-turn IDLE (the send loop only
+        # breaks when the last turn carried no tool calls), so the
+        # non-redundant coverage is a session rehydrated mid-wait —
+        # shipped for the shared park-gate shape, not to close a live
+        # hole.
+        if self._last_assistant_used_wait(session):
             return
 
         # Gate: read the task envelope.  A corrupt or unreadable blob
@@ -649,7 +611,6 @@ class CoordinatorIdleObserver:
         # so sanitising either side alone would empty the intersection
         # permanently and silently.
         bound_ws_id = ws_id
-        bound_user_id = ws.user_id
         bound_open_ids = frozenset(t["id"] for t in shown if t["id"])
         if not bound_open_ids:
             # No usable identity for anything the body names (every shown
@@ -669,36 +630,21 @@ class CoordinatorIdleObserver:
             return
 
         def _still_valid() -> bool:
-            # Half 1 — children.  Re-checked across the entry's whole
-            # queued lifetime, not just at enqueue: the coord can spawn
-            # children between enqueue and drain (worker owns the ws, a
-            # cancel demoted the entry to the quiet channel), and
-            # delivering "resume your task" beside live children is the
-            # contradictory pair.  ``None`` (indeterminate) drops too —
-            # ADVICE fails CLOSED, the exact opposite of the liveness
-            # predicate above, because the harms point opposite ways.
-            # NOTE the checked-first order: this is the correctness
-            # half; the staleness half below is only about wording.
+            # The predicate re-validates ONLY what the body asserts:
+            # that at least one task it NAMES is still open.  It reads
+            # no children state — each nudge asserts its own domain
+            # (module docstring), so an entry that outlives a bracket,
+            # survives a Stop demotion, or is resurrected by a failed
+            # wake and then delivers beside live children is two true
+            # statements, not a contradiction; the body's "children may
+            # still be running" line covers exactly that state.
             #
-            # This half is LOAD-BEARING and must not be replaced by the
-            # enqueue-time supersede in ``_enqueue_nudge``.  That
-            # supersede fires only when the sibling actually ENQUEUES,
-            # which is the ``if idle_children_fired`` shape gate 2 above
-            # forbids: a coord that spawns children and calls
-            # ``wait_for_workstream`` makes ``_maybe_enqueue_children``
-            # return at its wait-tool gate BY DESIGN, so nothing
-            # supersedes and only this check catches the now-stale entry.
-            # Same when liveness is inside its own cooldown or cap.
-            now = self._children_state_at_drain(bound_ws_id, bound_user_id)
-            if now is None or now:
-                return False
-            # Half 2 — the task list.  Corrupt/unreadable → drop;
-            # otherwise deliver only if at least one task the body NAMES
-            # is still open.  ``_open_tasks`` sits INSIDE the try: it
-            # walks raw envelope rows, so a ragged one is a data-shape
-            # condition, and letting it escape would surface as
-            # ``predicate_raised`` — which ``nudge_queue`` documents as a
-            # wiring bug, sending operators after a phantom code defect.
+            # Corrupt/unreadable envelope → drop (ADVICE fails closed).
+            # ``_open_tasks`` sits INSIDE the try: it walks raw envelope
+            # rows, so a ragged one is a data-shape condition, and
+            # letting it escape would surface as ``predicate_raised`` —
+            # which ``nudge_queue`` documents as a wiring bug, sending
+            # operators after a phantom code defect.
             try:
                 env, is_corrupt = load_task_envelope(self._storage, bound_ws_id)
                 if is_corrupt:
@@ -784,18 +730,16 @@ class CoordinatorIdleObserver:
 
     def _children_state_at_drain(self, ws_id: str, user_id: str) -> bool | None:
         """Memoised drain-time answer to "does this coord have active
-        children?", shared by BOTH classes' ``valid_until`` predicates.
+        children?", for the LIVENESS ``valid_until`` predicate.
 
-        The sharing is the correctness property, not the saved query.
-        Two unmemoised reads can disagree within one ``drain_entries``
-        pass, and because the classes map an indeterminate read in
-        opposite directions (liveness delivers, advice drops) a
-        disagreement is exactly how both nudges reach one turn.  One
-        observation makes the opposite directions consistent: whatever
-        the answer, at most one of the two entries survives it.
-
-        Do NOT "simplify" this back into two direct
-        :meth:`_active_children_now` calls.
+        The memo earns its keep with one caller: up to the liveness
+        per-type cap of entries can sit queued at once, and
+        ``drain_entries`` evaluates each ``valid_until`` independently —
+        unmemoised, entry 1 could deliver on a raise (fail-open) while
+        entry 2's read succeeds and drops microseconds later, one stale
+        body delivered beside one silently dropped.  One observation per
+        drain pass keeps same-class entries coherent, and N queued
+        entries cost one query, not N.
         """
         now = time.monotonic()
         with self._drain_children_lock:
@@ -835,8 +779,8 @@ class CoordinatorIdleObserver:
         creates a COORDINATOR row with a parent, so the two questions
         coincide.  If nested coordinators ever land, either push a kind
         param into the aggregate (protocol change) or accept that the
-        divergence lands in each class's safe direction (liveness
-        over-delivers, advice over-drops).
+        divergence lands in the safe direction (liveness over-delivers;
+        the advice predicate no longer reads children at all).
         """
         try:
             counts = self._storage.count_workstreams_by_state(

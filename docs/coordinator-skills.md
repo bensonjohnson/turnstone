@@ -150,9 +150,11 @@ dependency the coordinator may be able to clear itself, while
 `needs_operator` marks a task that cannot move without a decision,
 approval, or grant only the operator can give.  The distinction is
 load-bearing: a coordinator that goes idle holding open tasks gets
-nudged to pick them back up, and `needs_operator` is what tells that
-nudge the stop was deliberate.  Pair it with `note` to record what is
-being asked for.  Use
+nudged to pick them back up — even when children are still running, so
+keep the matrix honest rather than expecting the reminder to wait for
+an all-clear — and `needs_operator` is what tells that nudge the stop
+was deliberate.  Pair it with `note` to record what is being asked
+for.  Use
 `tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to
 link a task to the child that owns it once spawn returns.
 
