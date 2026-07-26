@@ -448,7 +448,7 @@
 }
 /* Shared by the `→ child` link row and the note row.  `word-break` is
    load-bearing for the note: it carries model-authored free text up to
-   _TASK_NOTE_MAX, and a `needs_operator` ask is exactly where an
+   _TASK_NOTE_MAX, and a `needs_user` ask is exactly where an
    unbroken token lands (a URL, a path, a credential endpoint).  Without
    it the token forces the row past the fixed sidebar width, because
    flex items default to `min-width: auto`.  The same string already
@@ -490,7 +490,7 @@
   border-color: color-mix(in srgb, var(--err) 45%, var(--hair));
   background: var(--err-soft);
 }
-/* needs_operator uses the --warn (gold / "attention") family rather than
+/* needs_user uses the --warn (gold / "attention") family rather than
    --err: a task waiting on the operator is not a failure, it is a queue
    the operator owns.  Distinct from --err-soft blocked, which is the
    coordinator's own dependency wall.
@@ -510,7 +510,7 @@
    has the identical AA failure.  Out of scope here (it predates this
    chip and belongs to the risk-badge surface); tracked separately rather
    than widened into this change. */
-.task-row .status-needs_operator {
+.task-row .status-needs_user {
   color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
   border-color: color-mix(in srgb, var(--warn) 45%, var(--hair));
   background: var(--warn-soft);

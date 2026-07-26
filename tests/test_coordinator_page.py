@@ -1245,7 +1245,7 @@ def test_task_status_vocabulary_is_pinned_across_every_surface():
         assert f".status-{status}" in css, f"status {status!r} needs a chip rule"
 
 
-def test_needs_operator_chip_darkens_warn_for_contrast():
+def test_needs_user_chip_darkens_warn_for_contrast():
     """Raw ``var(--warn)`` on ``--warn-soft`` measures ~3.6:1 in the light
     theme — under the 4.5:1 AA floor that applies at this chip's
     10px/600/uppercase, and the worst of the four status chips on the one
@@ -1257,16 +1257,16 @@ def test_needs_operator_chip_darkens_warn_for_contrast():
         Path(__file__).resolve().parent.parent
         / "turnstone/console/static/coordinator/coord-chrome.css"
     ).read_text(encoding="utf-8")
-    block = css.split(".task-row .status-needs_operator {", 1)[1].split("}", 1)[0]
+    block = css.split(".task-row .status-needs_user {", 1)[1].split("}", 1)[0]
     assert "color-mix(in srgb, var(--warn) 70%, var(--ink-2))" in block, (
-        "needs_operator chip text must darken --warn or it fails AA in the light theme"
+        "needs_user chip text must darken --warn or it fails AA in the light theme"
     )
     assert "color: var(--warn);" not in block
 
 
 def test_task_note_wraps_in_both_surfaces():
     """The same model-authored note renders in the sidebar and in the
-    idle-tasks card.  A ``needs_operator`` ask is exactly where an
+    idle-tasks card.  A ``needs_user`` ask is exactly where an
     unbroken token lands (a URL, a path), and flex items default to
     ``min-width: auto`` — so without word-break the sidebar row is forced
     past its fixed width."""

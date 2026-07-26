@@ -1065,7 +1065,7 @@ function createCoordinatorPane(root, wsId, opts) {
     in_progress: "in progress",
     done: "done",
     blocked: "blocked",
-    needs_operator: "needs you",
+    needs_user: "needs you",
   };
 
   function taskStatusKnown(status) {

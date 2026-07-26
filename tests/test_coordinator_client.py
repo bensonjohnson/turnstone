@@ -2914,17 +2914,17 @@ def test_format_inspect_tiered_full_tier_omits_tier_note():
 
 
 # ---------------------------------------------------------------------------
-# needs_operator status + note field
+# needs_user status + note field
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_add_accepts_needs_operator_status(tmp_path):
+def test_tasks_add_accepts_needs_user_status(tmp_path):
     """The status that marks a task as parked on the operator — the one
     signal the idle-tasks nudge gates on."""
     client = _task_client(tmp_path)
-    task = client.tasks_add("coord-1", title="pick a backend", status="needs_operator")
+    task = client.tasks_add("coord-1", title="pick a backend", status="needs_user")
     assert "error" not in task
-    assert task["status"] == "needs_operator"
+    assert task["status"] == "needs_user"
 
 
 def test_tasks_add_still_rejects_unknown_status(tmp_path):

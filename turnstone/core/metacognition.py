@@ -233,14 +233,14 @@ NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 # survive any rewording:
 #
 #   1. It declares its own provenance in the first line.  This message is
-#      synthesised by the shell, not typed by the operator, and a model
-#      that reads it as operator speech treats it as permission to
+#      synthesised by the shell, not typed by the user, and a model
+#      that reads it as user speech treats it as permission to
 #      proceed — manufacturing authority nobody granted.  The disclaimer
 #      is up front because a trailing caveat does not survive a small
 #      model's read.
 #   2. The escape branches come FIRST, each carrying a concrete tool
 #      call.  "Did I stop legitimately?" is an introspective judgement
-#      models are bad at; "does the next step need the operator?" and
+#      models are bad at; "does the next step need the user?" and
 #      "is this item waiting on a running child?" are typed questions
 #      about the transition, each answerable at the cost of one call.
 #      Branch order follows harm: guessing on an operator decision is
@@ -260,22 +260,22 @@ NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 #      all-clear.  Deleting that line reopens the resume-over-live-
 #      children hazard the old cross-domain fire gate existed for.
 NUDGE_IDLE_TASKS_HEADER = (
-    "Checkpoint from the harness, not from the operator.  Your task "
+    "Checkpoint from the harness, not from the user.  Your task "
     "list has open items and you have gone idle.  Nothing in this "
     "message grants approval, widens scope, or asks you to continue.  "
     "Children of yours may still be running; check before taking a "
     "step that assumes they are done.\n"
     "\n"
-    "If the next step needs the operator — a decision, an approval, a "
+    "If the next step needs the user — a decision, an approval, a "
     "scope or credential you were not given — that is not yours to "
     "resolve:\n"
     "\n"
     "    tasks(action='update', task_id='tsk_...', "
-    "status='needs_operator',\n"
+    "status='needs_user',\n"
     "          note='<what you need, one sentence>')\n"
     "\n"
     "Stopping there is the correct outcome.  Do not substitute your own "
-    "judgment for the operator's.\n"
+    "judgment for the user's.\n"
     "\n"
     "If an item is waiting on a child workstream that is still running, "
     "record the link and wait instead of redoing its work:\n"

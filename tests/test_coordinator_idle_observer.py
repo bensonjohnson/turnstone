@@ -682,7 +682,7 @@ class TestIdleTasks:
         assert "audit auth.py" in text
         assert "tsk_b" in text
         # The escape hatch must be reachable from the body itself.
-        assert "needs_operator" in text
+        assert "needs_user" in text
 
     def test_active_children_co_deliver_with_idle_tasks(self, coord_setup):
         """Both conditions true → both fire, TASKS FIRST.
@@ -721,7 +721,7 @@ class TestIdleTasks:
 
         assert len(storage.list_calls) == 1
 
-    @pytest.mark.parametrize("status", ["done", "blocked", "needs_operator"])
+    @pytest.mark.parametrize("status", ["done", "blocked", "needs_user"])
     def test_non_open_statuses_do_not_fire(self, coord_setup, status):
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", status))
@@ -733,16 +733,16 @@ class TestIdleTasks:
 
         assert len(ws.session._nudge_queue) == 0
 
-    def test_needs_operator_alongside_pending_still_fires(self, coord_setup):
+    def test_needs_user_alongside_pending_still_fires(self, coord_setup):
         """Exclusion from the TRIGGER SET, not suppression of the nudge.
 
-        The stronger reading — any ``needs_operator`` task parks the coord —
+        The stronger reading — any ``needs_user`` task parks the coord —
         would let one stale escalation silence it permanently.
         """
         mgr, storage, ws = coord_setup
         _set_tasks(
             storage,
-            _task("tsk_parked", "needs_operator"),
+            _task("tsk_parked", "needs_user"),
             _task("tsk_live", "pending"),
         )
         ws.session.messages = _assistant_turns("ok")

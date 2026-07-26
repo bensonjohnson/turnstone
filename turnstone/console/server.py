@@ -4388,7 +4388,7 @@ def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, A
     ``title`` and ``note`` are model-authored free text and this response
     feeds the operator's tasks pane, so a bidi override or zero-width run
     could make the pane display an ask in an order different from the one
-    stored — on a ``needs_operator`` row, the one the operator acts on.
+    stored — on a ``needs_user`` row, the one the operator acts on.
 
     Sanitising happens at each operator-facing render (here, the nudge
     formatter, the approval preview) rather than at the write, because

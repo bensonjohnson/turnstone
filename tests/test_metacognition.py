@@ -628,7 +628,7 @@ class TestFormatIdleTasksNudge:
         granted — the disclaimer is the whole reason this body differs
         from a plain 'you have unfinished tasks' reminder."""
         out = self._fmt([self._task()])
-        assert "not from the operator" in out
+        assert "not from the user" in out
         assert "grants approval" in out
 
     def test_escape_branch_precedes_resume_branch(self):
@@ -636,7 +636,7 @@ class TestFormatIdleTasksNudge:
         worse than a stale list.  A trailing caveat does not survive a
         small model's read, so the escape hatch leads."""
         out = self._fmt([self._task()])
-        assert out.index("needs_operator") < out.index("If the next step is yours")
+        assert out.index("needs_user") < out.index("If the next step is yours")
 
     def test_offers_done_branch_last(self):
         """Bookkeeping lag is real (without this branch a stale list makes
@@ -644,7 +644,7 @@ class TestFormatIdleTasksNudge:
         unattested, so it is never the salient option."""
         out = self._fmt([self._task()])
         assert "status='done'" in out
-        assert out.index("needs_operator") < out.index("status='done'")
+        assert out.index("needs_user") < out.index("status='done'")
 
     def test_blocked_on_child_branch_sits_between_escape_and_resume(self):
         """Branch order follows harm: guessing on an operator decision >
@@ -654,7 +654,7 @@ class TestFormatIdleTasksNudge:
         out = self._fmt([self._task()])
         assert "child_ws_id='ws_...'" in out
         assert "wait_for_workstream" in out
-        assert out.index("needs_operator") < out.index("child_ws_id='ws_...'")
+        assert out.index("needs_user") < out.index("child_ws_id='ws_...'")
         assert out.index("child_ws_id='ws_...'") < out.index("If the next step is yours")
 
     def test_never_asserts_children_are_done(self):

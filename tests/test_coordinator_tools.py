@@ -1899,7 +1899,7 @@ def test_tasks_prepare_add_preview_carries_note(coord_session):
             {
                 "action": "add",
                 "title": "pick a backend",
-                "status": "needs_operator",
+                "status": "needs_user",
                 "note": "which auth backend is canonical?",
             },
         )
@@ -1919,7 +1919,7 @@ def test_tasks_projection_carries_note_to_judge(coord_session, monkeypatch):
             {
                 "action": "update",
                 "task_id": "tsk_1",
-                "status": "needs_operator",
+                "status": "needs_user",
                 "note": "need a decision on the schema",
             },
         )

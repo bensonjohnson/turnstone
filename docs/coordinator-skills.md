@@ -143,16 +143,16 @@ A skill's initial prompt can seed the task list by calling
 the user gets a visible plan before any child is spawned, and the
 coordinator's future self has something concrete to iterate on.
 Status transitions (`pending` → `in_progress` → `done` / `blocked` /
-`needs_operator`) are the skill's main feedback loop: mutate the task
+`needs_user`) are the skill's main feedback loop: mutate the task
 when the child covering it finishes, not when the child starts.
-`blocked` and `needs_operator` are not interchangeable — `blocked` is a
+`blocked` and `needs_user` are not interchangeable — `blocked` is a
 dependency the coordinator may be able to clear itself, while
-`needs_operator` marks a task that cannot move without a decision,
-approval, or grant only the operator can give.  The distinction is
+`needs_user` marks a task that cannot move without a decision,
+approval, or grant only the user can give.  The distinction is
 load-bearing: a coordinator that goes idle holding open tasks gets
 nudged to pick them back up — even when children are still running, so
 keep the matrix honest rather than expecting the reminder to wait for
-an all-clear — and `needs_operator` is what tells that nudge the stop
+an all-clear — and `needs_user` is what tells that nudge the stop
 was deliberate.  Pair it with `note` to record what is being asked
 for.  Use
 `tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to

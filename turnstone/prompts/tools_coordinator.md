@@ -45,7 +45,7 @@ Plan and track work → tasks (your scratchpad; children don't see it):
    tasks(action='add', title='audit auth.py for CSRF')
    tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='in_progress')
    tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='in_progress', child_ws_id='ws_ab12cd34')
-   tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='needs_operator', note='which auth backend is canonical?')
+   tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='needs_user', note='which auth backend is canonical?')
    tasks(action='remove', task_id='tsk_4f9a1c7e2b30')
 
 Post a status update to a human channel at a narrative beat → notify (after close_all_children, on batch failure, on phase done):

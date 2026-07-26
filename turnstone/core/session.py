@@ -14262,7 +14262,7 @@ class ChatSession:
             # model actually sent.
             item["header"] = f"\u2699 tasks add: {_pf(title)}"
             # The note rides the preview because it is the operator-facing
-            # payload of the mutation — approving a ``needs_operator`` task
+            # payload of the mutation — approving a ``needs_user`` task
             # without seeing what the coordinator is asking for defeats the
             # point of the approval.
             add_bits = [f"status={_pf(status)}", f"child_ws_id={_pf(child_ws_id) or '-'}"]

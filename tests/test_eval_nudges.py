@@ -132,15 +132,15 @@ class TestStimulus:
         body = render_tasks_body(env)
         assert "tsk_1" in body and "audit auth.py" in body
         assert "may still be running" in body
-        assert "needs_operator" in body
-        assert "not from the operator" in body
+        assert "needs_user" in body
+        assert "not from the user" in body
 
     def test_no_provenance_arm_drops_only_the_first_paragraph(self):
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
         body = render_tasks_body(env, strip_provenance=True)
-        assert "not from the operator" not in body
+        assert "not from the user" not in body
         assert "may still be running" not in body  # rides the provenance paragraph
-        assert "needs_operator" in body and "tsk_1" in body
+        assert "needs_user" in body and "tsk_1" in body
 
     def test_ragged_envelope_rows_do_not_raise(self):
         env = _envelope(
@@ -170,19 +170,19 @@ class TestScoring:
     def test_expect_state_checks_status_note_and_link(self):
         case = {
             "expect_state": {
-                0: {"status": "needs_operator", "note_nonempty": True},
+                0: {"status": "needs_user", "note_nonempty": True},
                 1: {"status": "in_progress", "child_ws_id": "ws-c1"},
             }
         }
         good = _envelope(
-            {"id": "tsk_a", "status": "needs_operator", "note": "need the token"},
+            {"id": "tsk_a", "status": "needs_user", "note": "need the token"},
             {"id": "tsk_b", "status": "in_progress", "child_ws_id": "ws-c1"},
         )
         r = score_nudge_run([], good, case, {0: "tsk_a", 1: "tsk_b"})
         assert r["pass"], r["failures"]
 
         bad = _envelope(
-            {"id": "tsk_a", "status": "needs_operator", "note": "   "},
+            {"id": "tsk_a", "status": "needs_user", "note": "   "},
             {"id": "tsk_b", "status": "in_progress", "child_ws_id": ""},
         )
         r2 = score_nudge_run([], bad, case, {0: "tsk_a", 1: "tsk_b"})

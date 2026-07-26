@@ -190,25 +190,25 @@ _WS_REF_ERROR_TEXT_CAP: int = 2000
 # this dict by cross-surface tests, so a new status fails CI until every
 # surface knows it.
 #
-# ``blocked`` and ``needs_operator`` are deliberately distinct, and the
+# ``blocked`` and ``needs_user`` are deliberately distinct, and the
 # split is the whole point of the second value: ``blocked`` is waiting on
 # a dependency the coordinator may be able to clear itself (a build, a
 # sibling task, a child still running) — open=False because nudging is
 # noise while the dependency stands, but the model owns it.
-# ``needs_operator`` is waiting on a decision, approval, or grant that
-# ONLY the operator can make — open=False because nudging there pushes
+# ``needs_user`` is waiting on a decision, approval, or grant that
+# ONLY the user can make — open=False because nudging there pushes
 # the model to guess on a question it correctly escalated, the exact
 # failure the idle-tasks nudge exists to prevent.  Exclusion from the
 # trigger set is NOT suppression of the nudge: a coord holding one
-# ``needs_operator`` task and one ``pending`` task still fires, on the
-# strength of the pending one — the alternative (any ``needs_operator``
+# ``needs_user`` task and one ``pending`` task still fires, on the
+# strength of the pending one — the alternative (any ``needs_user``
 # task parks the coord) lets one stale escalation silence it permanently.
 _TASK_STATUS_IS_OPEN: dict[str, bool] = {
     "pending": True,
     "in_progress": True,
     "done": False,
     "blocked": False,
-    "needs_operator": False,
+    "needs_user": False,
 }
 _TASK_STATUSES = frozenset(_TASK_STATUS_IS_OPEN)
 TASK_OPEN_STATUSES: frozenset[str] = frozenset(
@@ -225,7 +225,7 @@ _TASKS_MAX = 500
 _TASK_TITLE_MAX = 200
 # Max task note length.  Same limit and the same reject-don't-truncate
 # rule as the title: a note carries the coordinator's one-sentence ask to
-# the operator, which is precisely the string where silent trimming loses
+# the user, which is precisely the string where silent trimming loses
 # the information the field exists to carry.  One number rather than two
 # so the schema has one sentence to explain.
 _TASK_NOTE_MAX = 200
