@@ -24,8 +24,8 @@ first — the grooming instruction is instant, the park instruction is
 open-ended, so the batch ends on the wait.  Each nudge asserts only its
 own domain: the tasks body never claims the children are gone (it
 carries an explicit "children may still be running" line, because the
-liveness nudge can be blocked by its own cooldown/cap/wait gate while
-advice fires alone), so a consistent pair is two true statements, not a
+liveness nudge can be blocked by its own cap or wait gate while advice
+fires alone), so a consistent pair is two true statements, not a
 contradiction.  One ordering caveat, accepted: a cross-bracket pair (an
 older queued ``idle_children`` surviving into a bracket that enqueues
 ``idle_tasks``) delivers children-first by seq; both entries are still
@@ -43,9 +43,12 @@ The class decides three behaviours, each ruled at its site:
   gates through ``ChatSession._nudges_enabled``, which also suppresses
   the nudge when the persona envelope hides the ``tasks`` tool its body
   instructs (``NUDGE_REQUIRED_TOOL``).
-* **Per-type caps** (:data:`_NUDGE_TYPE_CAPS`) — liveness 3, advice 2
-  per idle bracket; worst-case ceiling 5, and with both classes able to
-  fire in one bracket a single drain can deliver up to 5 bodies.
+* **Per-type caps** (:data:`_NUDGE_TYPE_CAPS`) — ONE fire per type per
+  idle bracket, and no cooldown at all: an idle nudge has a single exit
+  (enqueue → wake → delivered), so repeat fires would only re-prompt a
+  model that already read the body, at one autonomous turn each.  The
+  re-arm is operator progress, not the clock.  Both classes may fire in
+  one bracket, so a drain carries at most 2 bodies.
 * **Drain-predicate scope and failure direction.**  Each predicate
   re-validates ONLY its own assertion.  An indeterminate children read
   at drain DELIVERS a liveness entry (stale noise is cheap; a lost wake
@@ -55,14 +58,14 @@ The class decides three behaviours, each ruled at its site:
   closed).
 
 Gate order, ``idle_children`` (cheap → expensive; matches the code):
-coordinator-kind → cooldown peek → cap peek → wait-tool skip →
+coordinator-kind → cap peek → wait-tool skip →
 children query (``None``/``[]`` → no fire) → permission check
 (``nudge_allowed``) → atomic charge → enqueue → record.
 
 Gate order, ``idle_tasks``: coordinator-kind → operator-Stop gate
 (``_generation_abandoned``) → ``_nudges_enabled`` (config +
-``tasks``-tool visibility) → cooldown peek → cap peek →
-asked-operator skip → wait-tool skip → envelope read →
+``tasks``-tool visibility) → cap peek → asked-operator skip →
+wait-tool skip → envelope read →
 unidentifiable-set refusal (``bound_open_ids``) → permission check
 (``nudge_allowed``) → atomic charge → enqueue → record.
 
@@ -72,10 +75,9 @@ drain path delivers in seq order, which is what makes the ordering
 ruling hold with no queue changes.
 
 Caps reset when the ws leaves IDLE for a non-wake reason (tracked by
-``ChatSession._wake_source_tag``); cooldowns live per-type in the
-session's ``_metacog_state``.  Both are per-process state — if one
-coordinator were ever live in two console processes, caps and cooldowns
-would disagree across them (pre-existing shape, shared with every other
+``ChatSession._wake_source_tag``).  That state is per-process — if one
+coordinator were ever live in two console processes the counters would
+disagree across them (pre-existing shape, shared with every other
 per-process cache).
 """
 
@@ -90,7 +92,6 @@ from turnstone.console.coordinator_client import TASK_OPEN_STATUSES, load_task_e
 from turnstone.core.log import get_logger
 from turnstone.core.metacognition import (
     NUDGE_IDLE_TASKS_DISPLAY_CAP,
-    _cooldown_allows,
     _field_str,
     format_idle_children_nudge,
     format_idle_tasks_nudge,
@@ -116,8 +117,8 @@ log = get_logger(__name__)
 # streaming, or waiting on user attention).  Excludes "idle" (the
 # child is now waiting and can't be unblocked by the coord), "closed"
 # (gone), "deleted" (gone), and "error" (the model can't unblock an
-# errored child without operator intervention; cooldown handles repeat
-# fires for stuck-error children).
+# errored child without operator intervention; the per-bracket cap
+# handles repeat fires for stuck-error children).
 _ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
     {
         WorkstreamState.THINKING.value,
@@ -126,21 +127,30 @@ _ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
     }
 )
 
-# Per-type hard caps on idle-nudge fires per idle bracket, sized by
-# class: LIVENESS (``idle_children``) keeps the shipped budget of 3;
-# ADVICE (``idle_tasks``) gets 2.  Worst-case ceiling per bracket is 5.
+# ONE fire per type per idle bracket.  This cap is the ONLY limiter on
+# the idle nudges — they carry no cooldown, deliberately.
 #
-# Deliberately NOT a shared total: a summed cap lets advice fires spend
-# the liveness budget, so a coordinator that used its wakes on task
-# reminders reaches the silent-stall state (live children, no wake
-# left) strictly sooner than before ``idle_tasks`` existed.  The
-# liveness budget must be starvation-proof against advice.  The classes
-# are independent conditions and both can fire in one bracket, so the
-# ceiling is a real 5 — and with co-delivery one drain can carry up to 5
-# bodies (roughly 3-4 KB of system-reminder text).  Accepted: the caps
-# and the per-type 300s cooldowns bound it, and a bracket only
-# accumulates entries while the coordinator keeps going idle without
-# real operator input, which is itself the signal the nudges exist for.
+# An idle nudge has exactly ONE exit: enqueueing it makes the watcher
+# dispatch a wake, and that wake delivers it.  Unlike the memory-class
+# advisories — which are queued mid-turn and must wait for whichever
+# seam arrives next, so repeat fires buy extra chances at DELIVERY —
+# there is no second seam to wait for here.  Extra fires would only
+# re-prompt a model that has already read the body once, and each one
+# costs a full autonomous inference turn.  So the wall-clock cooldown
+# those other types need has no job on this path, and removing it makes
+# the cap the single, legible limiter: one reminder per stall.
+#
+# The re-arm is the operator, not the clock: ``_reset_caps_for`` clears
+# the counters on a real (non-wake) leave-IDLE, i.e. when the operator
+# actually moves the coordinator forward.  A coordinator that ignores
+# its nudge stays quiet until then, which is the honest behaviour — it
+# was told once.
+#
+# Still keyed per TYPE, not a shared total: advice must never be able to
+# spend the liveness budget, or a coord that used its wake on a task
+# reminder reaches the silent-stall state (live children, no wake left)
+# sooner than before ``idle_tasks`` existed.  Both classes may fire in
+# one bracket (co-delivery), so the per-bracket ceiling is 2 bodies.
 #
 # Every nudge type this observer emits MUST be registered here — the
 # lookup KeyErrors on an unregistered type (surfacing via _on_state's
@@ -150,8 +160,8 @@ _ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
 # versa) is exactly the misclassification this table exists to force a
 # decision on.
 _NUDGE_TYPE_CAPS: dict[str, int] = {
-    "idle_children": 3,
-    "idle_tasks": 2,
+    "idle_children": 1,
+    "idle_tasks": 1,
 }
 
 # Soft cap on the snapshot query.  Higher than ``WAIT_MAX_WS_IDS`` so
@@ -264,7 +274,7 @@ class CoordinatorIdleObserver:
         park instruction, not start with it (module docstring).
 
         The children query lives INSIDE the children path, after its
-        cheap gates: most IDLE events short-circuit on cooldown/cap
+        cheap gates: most IDLE events short-circuit on the cap peek
         (microsecond dict lookups), and computing it eagerly here would
         put a ``list_workstreams`` round-trip on every coord state
         transition in the cluster.  The tasks path does not read
@@ -310,22 +320,21 @@ class CoordinatorIdleObserver:
     # shared gate head / enqueue tail
     # ------------------------------------------------------------------
 
-    def _common_gates_allow(self, session: ChatSession, ws_id: str, nudge_type: str) -> int | None:
-        """The gate head both paths run identically: cooldown peek +
-        per-type cap peek, both microsecond dict lookups.
+    def _common_gates_allow(self, session: ChatSession, ws_id: str, nudge_type: str) -> bool:
+        """The gate head both paths run identically: the per-type cap
+        peek, a microsecond dict lookup.
 
-        Returns the cooldown seconds (``nudge_allowed`` needs the same
-        number again) when the gates pass, ``None`` when blocked.  Kept
-        in one place so a cross-cutting change to the cheap gates lands
-        on both nudge types at once — this file has already paid once
-        for editing the head twice.
+        Returns ``True`` when the gates pass.  Kept in one place so a
+        cross-cutting change to the cheap gates lands on both nudge
+        types at once — this file has already paid once for editing the
+        head twice.
+
+        NO cooldown peek: the idle nudges are cap-only (see
+        :data:`_NUDGE_TYPE_CAPS`).  ``memory.nudge_cooldown`` governs the
+        memory-class advisories, which wait for a seam; these fire once
+        per bracket and are re-armed by operator progress instead.
         """
-        cooldown_secs = getattr(session._mem_cfg, "nudge_cooldown", 300)
-        if not _cooldown_allows(nudge_type, session._metacog_state, cooldown_secs=cooldown_secs):
-            return None
-        if self._cap_reached(ws_id, nudge_type):
-            return None
-        return cooldown_secs
+        return not self._cap_reached(ws_id, nudge_type)
 
     def _enqueue_nudge(
         self,
@@ -336,7 +345,6 @@ class CoordinatorIdleObserver:
         text: str,
         metadata: dict[str, Any] | None,
         valid_until: Callable[[], bool],
-        cooldown_secs: int,
     ) -> bool:
         """The shared enqueue tail: ``nudge_allowed`` (the authoritative
         permission check), the formatter empty-body guard, the atomic
@@ -353,12 +361,16 @@ class CoordinatorIdleObserver:
         nothing.  If a future nudge type routed through here needs it,
         thread it explicitly.
         """
+        # ``cooldown_secs=0`` — the idle nudges are cap-only.  This call
+        # is still here for the gates a cap cannot express: unknown type,
+        # and ``message_count <= 1`` (a rehydrated or freshly-truncated
+        # session should not be nudged about work it cannot yet see).
         if not nudge_allowed(
             nudge_type,
             session._metacog_state,
             message_count=len(session.messages),
             memory_count=0,
-            cooldown_secs=cooldown_secs,
+            cooldown_secs=0,
         ):
             return False
         if not text:  # belt-and-braces: formatter empty-input guard
@@ -373,8 +385,9 @@ class CoordinatorIdleObserver:
             valid_until=valid_until,
             metadata=metadata,
         )
-        # Record LAST — the cooldown is budget, and a refused fire must
-        # never burn it.  ``should_nudge`` stamps on success, so calling
+        # Record LAST.  Inert for these two types (they run
+        # ``cooldown_secs=0``), but the ORDER is the discipline: a
+        # refused fire must never burn budget.  ``should_nudge`` stamps on success, so calling
         # it here would spend the 300s window at the permission check,
         # before ``_try_charge`` (the authoritative gate) has said yes:
         # the loser of a cap race then loses its next fire too, having
@@ -384,6 +397,12 @@ class CoordinatorIdleObserver:
         # rehydrated session, an unregistered type), so the cap would be
         # charged on every one of those refusals.  Permission, then
         # charge, then deliver, then record.
+        # Stamp the fire.  With ``cooldown_secs=0`` this no longer GATES
+        # anything for these two types — the cap does — but it keeps the
+        # per-type timestamp other tooling reads, and it keeps the
+        # permission/charge/deliver/record order intact so a future type
+        # routed through here that DOES want a cooldown inherits the
+        # correct discipline rather than the bug (#924).
         record_nudge(nudge_type, session._metacog_state)
         return True
 
@@ -419,8 +438,7 @@ class CoordinatorIdleObserver:
         """
         ws_id = ws.id
 
-        cooldown_secs = self._common_gates_allow(session, ws_id, "idle_children")
-        if cooldown_secs is None:
+        if not self._common_gates_allow(session, ws_id, "idle_children"):
             return
 
         # Gate: skip if the coord's last assistant turn already used
@@ -488,7 +506,6 @@ class CoordinatorIdleObserver:
             text=text,
             metadata={"children": children_meta},
             valid_until=_still_has_active_children,
-            cooldown_secs=cooldown_secs,
         ):
             log.info(
                 "coord_idle_observer.enqueued ws=%s active_children=%d",
@@ -539,8 +556,7 @@ class CoordinatorIdleObserver:
         if not session._nudges_enabled("idle_tasks"):
             return
 
-        cooldown_secs = self._common_gates_allow(session, ws_id, "idle_tasks")
-        if cooldown_secs is None:
+        if not self._common_gates_allow(session, ws_id, "idle_tasks"):
             return
 
         # Gate: the coord's last assistant turn looks like a question put
@@ -703,7 +719,6 @@ class CoordinatorIdleObserver:
             text=text,
             metadata={"tasks": tasks_meta, "total": total_open},
             valid_until=_still_valid,
-            cooldown_secs=cooldown_secs,
         ):
             log.info(
                 "coord_idle_observer.enqueued_tasks ws=%s open_tasks=%d shown=%d",

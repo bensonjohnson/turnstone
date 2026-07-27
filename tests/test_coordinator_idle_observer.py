@@ -389,18 +389,14 @@ class TestHardCap:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
-        # Bypass cooldown for this test: each call burns a per-type slot
-        # in ``_metacog_state`` so we need to clear it between fires.
-        for _ in range(3):
-            ws.session._metacog_state.clear()
+        # Cap = ONE fire per type per bracket, and there is no cooldown
+        # to bypass — the cap is the only limiter.  Four IDLE events, one
+        # entry.
+        for _ in range(4):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        # Cap = 3 fires.  Even with cooldown bypassed, the 4th doesn't fire.
-        ws.session._metacog_state.clear()
-        mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        # We enqueued 3 entries total; cap blocked the 4th.
         snap = ws.session._nudge_queue.pending("any")
-        assert len(snap) == 3
+        assert len(snap) == 1
 
     def test_cap_resets_when_state_leaves_idle_without_wake(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -415,11 +411,10 @@ class TestHardCap:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
-        # Burn the cap.
+        # Burn the cap (one fire).
         for _ in range(3):
-            ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 3
+        assert len(ws.session._nudge_queue.pending("any")) == 1
 
         # Drain the queue (simulate the watcher delivering them).
         ws.session._nudge_queue.drain({"any"})
@@ -428,8 +423,8 @@ class TestHardCap:
         ws.session._wake_source_tag = ""
         mgr.fire_state(ws.id, WorkstreamState.RUNNING)
 
-        # New IDLE — cap is fresh, fires again.
-        ws.session._metacog_state.clear()
+        # New IDLE — cap is fresh, fires again.  Operator progress is
+        # the re-arm, not the clock.
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert len(ws.session._nudge_queue.pending("any")) == 1
 
@@ -869,27 +864,26 @@ class TestIdleTasks:
 
 
 class TestPerClassCaps:
-    """Caps are per nudge TYPE, sized by class: liveness 3, advice 2.
+    """Caps are per nudge TYPE: ONE fire each per idle bracket.
 
-    A summed cap lets advice fires spend the liveness budget, so a
-    coordinator that used its wakes on task reminders reaches the
-    silent-stall state (live children, no wake left) strictly sooner
-    than before ``idle_tasks`` existed.  The liveness budget must be
-    starvation-proof against advice; the price is a combined ceiling of
-    5 rather than 3.
+    Per-type rather than a shared total so advice can never spend the
+    liveness budget — a coordinator that used its wake on a task
+    reminder would otherwise reach the silent-stall state (live
+    children, no wake left) sooner than before ``idle_tasks`` existed.
+
+    ONE rather than several because an idle nudge has a single exit
+    (enqueue -> wake -> delivered); repeat fires buy no extra chance at
+    delivery, only a re-prompt of a model that already read the body,
+    at one autonomous turn each.  There is no cooldown on this path.
     """
 
-    def test_advice_fires_do_not_starve_the_liveness_budget(self, coord_setup):
+    def test_advice_fire_does_not_starve_the_liveness_budget(self, coord_setup):
         """The whole point of per-class caps.
 
-        Spend the advice budget first, then put children back in play:
-        liveness must still have its full allowance, because a
-        coordinator with running children must be wakeable regardless of
-        how many task reminders preceded it.
-
-        The classes co-exist in the queue (co-delivery), so the ceiling
-        is a real 5: the two advice entries stay queued while liveness
-        spends its independent 3.
+        Spend the advice slot first, then put children back in play:
+        liveness must still have its own, because a coordinator with
+        running children must be wakeable regardless of what preceded
+        it.  Both classes co-exist in the queue (co-delivery).
         """
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -897,23 +891,20 @@ class TestPerClassCaps:
 
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
-        for _ in range(4):  # advice caps at 2 — the last two are refused
-            ws.session._metacog_state.clear()  # bypass the cooldown, not the cap
+        for _ in range(3):  # advice caps at 1 — the rest are refused
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"] * 2
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
 
-        # Children appear; the liveness budget is untouched by the advice
-        # spend above.  Under the old summed cap this produced ONE fire
-        # (3 - 2 already spent), stalling the coord two wakes early.
+        # Children appear; the liveness slot is untouched by the advice
+        # spend above.  Under a summed cap this produced NOTHING.
         _add_active_child(storage, ws_id="child-a", state="running")
-        for _ in range(4):  # liveness caps at 3
-            ws.session._metacog_state.clear()
+        for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
-        assert types == ["idle_tasks"] * 2 + ["idle_children"] * 3
+        assert types == ["idle_tasks", "idle_children"]
 
-    def test_liveness_cap_is_three(self, coord_setup):
+    def test_liveness_cap_is_one(self, coord_setup):
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")
@@ -921,12 +912,11 @@ class TestPerClassCaps:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         for _ in range(5):
-            ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert len(ws.session._nudge_queue) == 3
+        assert len(ws.session._nudge_queue) == 1
 
-    def test_advice_cap_is_two(self, coord_setup):
+    def test_advice_cap_is_one(self, coord_setup):
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -934,17 +924,35 @@ class TestPerClassCaps:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         for _ in range(5):
-            ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert len(ws.session._nudge_queue) == 2
+        assert len(ws.session._nudge_queue) == 1
+
+    def test_no_cooldown_gates_the_idle_nudges(self, coord_setup):
+        """The cap is the ONLY limiter: a stale per-type timestamp in
+        ``_metacog_state`` must not suppress a fire, and clearing it
+        must not enable an extra one."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+        ws.session._metacog_state["idle_children"] = time.monotonic()  # "just fired"
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1, "a stale stamp must not gate"
+
+        # ...and clearing the stamp does not buy a second fire.
+        ws.session._metacog_state.clear()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1, "only the cap limits"
 
     def test_refused_fire_does_not_burn_budget(self, coord_setup):
         """The charge sits at the enqueue, not at the cheap peek.
 
-        A coord that goes idle with a trailing '?' (or inside its
-        cooldown, or with nothing open) must not spend a slot — the cap
-        counts nudges DELIVERED, not IDLE events observed.
+        A coord that goes idle with a trailing '?' (or with nothing
+        open) must not spend its slot — the cap counts nudges
+        DELIVERED, not IDLE events observed.
         """
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
@@ -954,36 +962,31 @@ class TestPerClassCaps:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         for _ in range(3):
-            ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
         assert len(ws.session._nudge_queue) == 0
 
-        # The turn no longer reads as a question — the full advice
-        # budget must still be available.
+        # The turn no longer reads as a question — the advice slot must
+        # still be available.
         ws.session.messages = _assistant_turns("ok")
-        for _ in range(3):
-            ws.session._metacog_state.clear()
-            mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue) == 2
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
 
     def test_caps_reset_on_real_leave_idle(self, coord_setup):
+        """Operator progress is the re-arm."""
         mgr, storage, ws = coord_setup
-        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")
 
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
-        for _ in range(3):
-            ws.session._metacog_state.clear()
-            mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue) == 2
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
+        ws.session._nudge_queue.clear()
 
-        # Real user input (no wake tag) clears the budget for both classes.
         ws.session._wake_source_tag = ""
         mgr.fire_state(ws.id, WorkstreamState.RUNNING)
-        ws.session._metacog_state.clear()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue) == 3
+        assert len(ws.session._nudge_queue) == 1
 
 
 class TestNudgesDisabledSwitch:
@@ -1173,18 +1176,27 @@ class TestIndeterminateChildrenRead:
     def test_children_query_skipped_when_liveness_gates_short_circuit(self, coord_setup):
         """The laziness ruling, pinned: the children query sits AFTER
         the liveness path's cheap gates, so an IDLE event where liveness
-        is cooldown-blocked costs ZERO ``list_workstreams`` round-trips
-        even while the advice path fires."""
+        is cap-blocked costs ZERO ``list_workstreams`` round-trips even
+        while the advice path fires."""
         mgr, storage, ws = coord_setup
-        _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
-        ws.session._metacog_state["idle_children"] = time.time()  # inside cooldown
-
+        # Bracket 1: children only, no tasks — liveness spends its slot,
+        # advice never fires (nothing open).
+        _add_active_child(storage, ws_id="child-a", state="running")
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
 
-        assert len(storage.list_calls) == 0
+        # Bracket 2 (same bracket, no reset): tasks appear.  Liveness is
+        # cap-blocked, so its children query must not run at all.
+        ws.session._nudge_queue.clear()
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        before = len(storage.list_calls)
+
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(storage.list_calls) == before
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
         assert types == ["idle_tasks"]
 
@@ -1422,9 +1434,14 @@ class TestDrainChildrenMemo:
         ws.session.messages = _assistant_turns("ok")
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
-        for _ in range(3):  # queue the full liveness budget
-            ws.session._metacog_state.clear()
+        # Accumulate three queued liveness entries ACROSS brackets: the
+        # cap allows one per bracket, and a real (non-wake) leave-IDLE
+        # re-arms it.  This is the shape the drain memo exists for — N
+        # entries evaluated in one drain pass must share one query.
+        for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
+            ws.session._wake_source_tag = ""
+            mgr.fire_state(ws.id, WorkstreamState.RUNNING)
         assert len(ws.session._nudge_queue) == 3
 
         before = len(storage.count_calls)
@@ -1517,10 +1534,9 @@ class TestCoDelivery:
         storage.children.clear()
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         for _ in range(3):
-            ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
         types = [t for t, _ in ws.session._nudge_queue.pending("any")]
-        assert types == ["idle_children"] + ["idle_tasks"] * 2
+        assert types == ["idle_children", "idle_tasks"]
 
     def test_both_types_drain_in_seq_order(self, coord_setup):
         """One IDLE event, both conditions → one drain delivers both,
@@ -1844,9 +1860,9 @@ class TestUnidentifiableTasksAreNotClaimed:
         assert len(ws.session._nudge_queue) == 0
 
     def test_budget_survives_an_unidentifiable_list(self, coord_setup):
-        """The failure that made this worth a gate: without it each IDLE
-        charged a cap slot and stamped the cooldown for an entry that
-        could never be delivered."""
+        """The failure that made this worth a gate: without it an IDLE
+        charged the cap slot for an entry that could never be
+        delivered, and the coordinator's one reminder was gone."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, {"title": "no id", "status": "pending"})
         ws.session.messages = _assistant_turns("ok")
@@ -1856,12 +1872,10 @@ class TestUnidentifiableTasksAreNotClaimed:
         for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        # A well-formed list now arrives; the full advice budget is intact.
+        # A well-formed list now arrives; the advice slot is intact.
         _set_tasks(storage, _task("tsk_a", "pending"))
-        for _ in range(3):
-            ws.session._metacog_state.clear()
-            mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue) == 2
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
 
     def test_partially_identifiable_list_still_fires(self, coord_setup):
         mgr, storage, ws = coord_setup
