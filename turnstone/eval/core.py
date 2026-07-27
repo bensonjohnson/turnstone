@@ -339,11 +339,6 @@ class HeadlessSession(ChatSession):
             registry=self._registry,
             capabilities=self._get_capabilities(),
         )
-        # System prompts live as wire dicts on the session; bridge them to
-        # Turn IR once — they are invariant for the run (only __init__ /
-        # set_skill recompose them, both before send_headless).  Only the
-        # growing ``self.messages`` concatenation happens per turn.
-        system_turns = turns_from_dicts(self.system_messages)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -353,7 +348,20 @@ class HeadlessSession(ChatSession):
                 _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
 
             t0 = time.monotonic()
-            turns = system_turns + self.messages
+            # PRODUCTION WIRE, not a shortcut concatenation.  The send
+            # path lowers through ``_prepare_wire_messages``: sender
+            # labels, then ``fold_system_turns`` (which wraps
+            # mid-conversation operator turns in the nonce-fenced
+            # ``[start system-reminder]`` block for models whose
+            # capability row lacks native mid-conversation system
+            # support), then empty-user-turn drop, tool-arg
+            # legalization, and id repair.  Concatenating raw turns
+            # here sent a wire shape production never emits — it
+            # happened to be accepted by one endpoint and hard-rejected
+            # ("System message must be at the beginning") by another,
+            # and either way the nudge eval was measuring the wrong
+            # stimulus.
+            turns = turns_from_dicts(self._prepare_wire_messages(self._full_messages()))
 
             if self._cancelled.is_set():
                 break

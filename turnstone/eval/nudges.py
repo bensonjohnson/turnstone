@@ -32,9 +32,13 @@ approximate payload shapes (scoring keys on the CALLS made and the task
 STATE, never on stub payload fidelity), and runs execute serially —
 ``init_storage`` is process-global, so in-process parallelism would
 cross-contaminate; a subprocess pool can lift that later, mirroring
-``_run_and_score_subprocess``.  Mid-list system turns ride the wire as
-plain ``system`` role messages — correct for the OpenAI-compat lanes
-the local panel runs on, which is where the target failure mode lives.
+``_run_and_score_subprocess``.
+
+The injected system turns reach the wire through the SAME lowering
+production uses (``_prepare_wire_messages`` → ``fold_system_turns``),
+so a model whose capability row lacks native mid-conversation system
+support sees the nonce-fenced ``[start system-reminder]`` block folded
+onto the wake turn — exactly what a real coordinator would send it.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Any
+from typing import Any, cast
 
 from openai import OpenAI
 
@@ -548,20 +552,72 @@ def _body_override(header_text: str | None) -> Any:
         _metacog.NUDGE_IDLE_TASKS_HEADER = original
 
 
-def _endpoint_identity(base_url: str, api_key: str) -> dict[str, Any] | None:
-    """The served model's identity stamp (``id`` + ``created``).
+_CANARY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
 
-    A served-name is NOT an identity: a vLLM restart mid-arc swapped
-    behavior under the same alias and silently invalidated a sweep
-    (the created timestamp was the only witness).  Best-effort — an
-    endpoint without ``/models`` yields ``None``, never an error.
+
+def tool_call_canary(
+    base_url: str,
+    api_key: str,
+    model: str,
+    *,
+    max_tokens: int = 8192,
+    attempts: int = 3,
+) -> bool:
+    """Does this endpoint emit STRUCTURED tool calls right now?
+
+    vLLM builds have been observed to stop parsing tool calls part-way
+    through a server's life: the model keeps answering, calls arrive as
+    prose, and every run scores zero for a reason that has nothing to do
+    with the body under test.  This probe turns a silently-wasted sweep
+    into a loud abort with a known remedy (restart the container).
+
+    Three properties are load-bearing, each learned by getting it wrong:
+
+    * **Never ``tool_choice="required"``.**  On the qwen3.6 build this
+      was written against, forcing produced ``finish_reason="tool_calls"``
+      with an EMPTY ``tool_calls`` list on 2 of 3 probes while natural
+      tool choice was 3 for 3 — the guided-decoding path manufactures
+      the exact failure the canary exists to detect.
+    * **Budget generously** (default 8192, or the sweep's own
+      ``max_tokens``).  A thinking model burns the budget inside its
+      reasoning block; a starved probe returns
+      ``finish_reason="length"`` with empty content and empty reasoning,
+      which is indistinguishable from a dead parser.  256 tokens read as
+      a broken endpoint on a healthy one.
+    * **Retry.**  With natural tool choice the model may legitimately
+      answer in prose; one probe is not evidence.  Any success across
+      *attempts* means the parser works.
+
+    NOT a version/identity check.  ``/v1/models``' ``created`` field is
+    stamped at REQUEST time (verified: it tracks wall-clock across
+    back-to-back calls), so it can never witness a restart — an earlier
+    guard built on it reported drift on every sweep.
     """
-    try:
-        data = OpenAI(base_url=base_url, api_key=api_key, timeout=10.0).models.list()
-        m = data.data[0]
-        return {"id": m.id, "created": getattr(m, "created", None)}
-    except Exception:
-        return None
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=300.0)
+    for _ in range(attempts):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+                tools=[cast("Any", _CANARY_TOOL)],
+                max_tokens=max_tokens,
+            )
+            if resp.choices[0].message.tool_calls:
+                return True
+        except Exception:
+            log.warning("eval_nudges.canary_probe_failed", exc_info=True)
+    return False
 
 
 def run_nudge_response(
@@ -588,8 +644,15 @@ def run_nudge_response(
     forbidden_rate, runs}}}}`` — bars are applied by the operator after
     the baseline sweep, not encoded here.
     """
-    ident_start = _endpoint_identity(base_url, api_key)
-    out: dict[str, Any] = {"model": model, "endpoint_start": ident_start, "cells": {}}
+    if not tool_call_canary(base_url, api_key, model, max_tokens=max_tokens):
+        raise SystemExit(
+            f"{RED}ABORT{RESET}: {base_url} ({model}) did not emit a structured tool "
+            "call for the canary probe.\n"
+            "  Every run would score zero for a reason unrelated to the body under "
+            "test.\n"
+            "  Restart the serving container and re-run."
+        )
+    out: dict[str, Any] = {"model": model, "cells": {}}
     with _body_override(body_override_text):
         for ci, case in enumerate(cells):
             cell_arms = arms or case.get("arms", [ARM_NUDGE])
@@ -642,13 +705,14 @@ def run_nudge_response(
                     "runs": runs,
                 }
             out["cells"][case["id"]] = cell_out
-    ident_end = _endpoint_identity(base_url, api_key)
-    out["endpoint_end"] = ident_end
-    out["endpoint_drifted"] = bool(ident_start and ident_end and ident_start != ident_end)
-    if out["endpoint_drifted"]:
+    # Re-probe at the end: a mid-sweep tool-parser failure invalidates
+    # every cell after it, and the per-cell zeros read as a body
+    # regression rather than an endpoint fault.
+    out["canary_after"] = tool_call_canary(base_url, api_key, model, max_tokens=max_tokens)
+    if not out["canary_after"]:
         print(
-            f"\n  {RED}ENDPOINT DRIFTED MID-SWEEP{RESET}: {ident_start} -> {ident_end}\n"
-            "  The serving instance changed under the alias; results in this\n"
-            "  file are NOT comparable to other sweeps or to themselves."
+            f"\n  {RED}ENDPOINT STOPPED EMITTING TOOL CALLS MID-SWEEP{RESET}\n"
+            "  Results after the failure point are meaningless; restart the\n"
+            "  serving container and re-run this sweep."
         )
     return out
