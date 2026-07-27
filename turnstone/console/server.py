@@ -59,7 +59,7 @@ from turnstone.core.auth import (
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
-from turnstone.core.metacognition import _field_str, sanitize_name
+from turnstone.core.metacognition import field_str, sanitize_name
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -4398,7 +4398,7 @@ def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, A
     stays verbatim, so the model reads back what it sent through
     ``tasks(action='list')``.
 
-    Ragged-row coercion goes through ``metacognition._field_str`` — the
+    Ragged-row coercion goes through ``metacognition.field_str`` — the
     same single coercion point the nudge card's producer uses — so the
     two operator-facing surfaces cannot disagree on a ragged row (the
     previous ``str(x or "")`` mapped ``0``/``False`` to ``""`` while the
@@ -4423,13 +4423,13 @@ def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, A
             continue
         row = {
             **row,
-            "id": _field_str(row.get("id")),
-            "title": sanitize_name(_field_str(row.get("title"))),
-            "status": _field_str(row.get("status")),
-            "child_ws_id": _field_str(row.get("child_ws_id")),
+            "id": field_str(row.get("id")),
+            "title": sanitize_name(field_str(row.get("title"))),
+            "status": field_str(row.get("status")),
+            "child_ws_id": field_str(row.get("child_ws_id")),
         }
         if "note" in row:
-            row["note"] = sanitize_name(_field_str(row.get("note")))
+            row["note"] = sanitize_name(field_str(row.get("note")))
         clean.append(row)
     return {**envelope, "tasks": clean}
 

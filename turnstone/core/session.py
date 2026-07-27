@@ -1739,7 +1739,7 @@ class ChatSession:
         self._wake_source_tag: str = ""
         # True between an abandoned generation (cancel / interrupt /
         # fatal error) and the next ``send``.  Read by producers that
-        # must not treat the IDLE such a path emits as an invitation to
+        # must not treat the IDLE that such a path emits as an invitation to
         # wake the workstream back up.
         self._generation_abandoned: bool = False
         # Nudge entries pre-drained by ``deliver_wake_nudge_from_queue``

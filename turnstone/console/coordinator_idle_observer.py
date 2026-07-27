@@ -92,7 +92,7 @@ from turnstone.console.coordinator_client import TASK_OPEN_STATUSES, load_task_e
 from turnstone.core.log import get_logger
 from turnstone.core.metacognition import (
     NUDGE_IDLE_TASKS_DISPLAY_CAP,
-    _field_str,
+    field_str,
     format_idle_children_nudge,
     format_idle_tasks_nudge,
     nudge_allowed,
@@ -857,7 +857,7 @@ class CoordinatorIdleObserver:
 
         This is the single coercion point for both downstream consumers
         (the nudge formatter and the FE card metadata), so the two can
-        never disagree on a ragged row.  ``_field_str`` maps ``None`` →
+        never disagree on a ragged row.  ``field_str`` maps ``None`` →
         ``""`` — a bare ``str()`` here once rendered a JSON ``null``
         note as a literal ``None`` line in the operator card while the
         prose showed nothing.  The envelope is a JSON blob a hand-edited
@@ -879,15 +879,15 @@ class CoordinatorIdleObserver:
             # whole nudge path, which the observer swallows, silencing
             # this coordinator's nudge permanently.  Coerced, it simply
             # fails to match and the row is skipped.
-            status = _field_str(row.get("status"))
+            status = field_str(row.get("status"))
             if status not in TASK_OPEN_STATUSES:
                 continue
             out.append(
                 {
-                    "id": _field_str(row.get("id")),
-                    "title": _field_str(row.get("title")),
+                    "id": field_str(row.get("id")),
+                    "title": field_str(row.get("title")),
                     "status": status,
-                    "note": _field_str(row.get("note")),
+                    "note": field_str(row.get("note")),
                 }
             )
         return out

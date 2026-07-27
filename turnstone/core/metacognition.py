@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import time
+from typing import Any
 
 # Default cooldown (s) between nudges of the same type.  Production
 # paths pass ``cooldown_secs`` explicitly from
@@ -316,7 +317,7 @@ NUDGE_IDLE_TASKS_HEADER = (
     "\n"
     "    tasks(action='update', task_id='tsk_...', "
     "status='in_progress',\n"
-    "          child_ws_id='ws_...')\n"
+    "          child_ws_id='a1b2c3d4')\n"
     "\n"
     "then wait_for_workstream.\n"
     "\n"
@@ -458,7 +459,7 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _field_str(value: object) -> str:
+def field_str(value: object) -> str:
     """Coerce a task-row field to ``str`` for rendering.
 
     ``None`` (a JSON ``null`` in the stored envelope) maps to ``""`` —
@@ -473,7 +474,7 @@ def _field_str(value: object) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def format_idle_tasks_nudge(shown: list[dict[str, str]], *, total: int) -> str:
+def format_idle_tasks_nudge(shown: list[dict[str, Any]], *, total: int) -> str:
     """Render the ``idle_tasks`` reminder body.
 
     *shown* is the ALREADY-CAPPED list of rows this nudge asserts, and
@@ -516,14 +517,14 @@ def format_idle_tasks_nudge(shown: list[dict[str, str]], *, total: int) -> str:
         return ""
     lines = [NUDGE_IDLE_TASKS_HEADER, ""]
     for t in shown:
-        # ``_field_str`` before ``sanitize_name``: the observer normalises
+        # ``field_str`` before ``sanitize_name``: the observer normalises
         # rows in production, but a direct caller may pass raw envelope
         # rows and ``sanitize_name`` raises ``TypeError`` on a non-``str``.
-        task_id = sanitize_name(_field_str(t.get("id_display") or t.get("id")))
-        title = sanitize_name(_field_str(t.get("title"))) or "(untitled)"
-        status = _field_str(t.get("status")) or "?"
+        task_id = sanitize_name(field_str(t.get("id_display") or t.get("id")))
+        title = sanitize_name(field_str(t.get("title"))) or "(untitled)"
+        status = sanitize_name(field_str(t.get("status"))) or "?"
         line = f"  - {task_id} ({status}): {title}"
-        note = sanitize_name(_field_str(t.get("note")))
+        note = sanitize_name(field_str(t.get("note")))
         if note:
             line += f" [note: {note}]"
         lines.append(line)

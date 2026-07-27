@@ -44,7 +44,7 @@ Wind all direct children down at once → close_all_children (soft-close cascade
 Plan and track work → tasks (your scratchpad; children don't see it):
    tasks(action='add', title='audit auth.py for CSRF')
    tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='in_progress')
-   tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='in_progress', child_ws_id='ws_ab12cd34')
+   tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='in_progress', child_ws_id='a1b2c3d4')
    tasks(action='update', task_id='tsk_4f9a1c7e2b30', status='needs_user', note='which auth backend is canonical?')
    tasks(action='remove', task_id='tsk_4f9a1c7e2b30')
 

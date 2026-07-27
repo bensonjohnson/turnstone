@@ -3101,7 +3101,7 @@ def test_display_sanitiser_passes_ragged_rows_through(tmp_path):
 
 
 def test_display_sanitiser_coerces_ragged_rows_like_the_nudge_card(tmp_path):
-    """Shared ``_field_str`` coercion: ``str(x or "")`` mapped ``0`` to
+    """Shared ``field_str`` coercion: ``str(x or "")`` mapped ``0`` to
     ``""`` while the nudge card's producer rendered ``"0"`` — two
     operator-facing surfaces disagreeing on the same stored row.  And a
     coerced ``status`` means the FE's ``task.status || "pending"``

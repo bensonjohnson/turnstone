@@ -60,7 +60,7 @@ from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.log import get_logger
 from turnstone.core.metacognition import (
     NUDGE_IDLE_TASKS_DISPLAY_CAP,
-    _field_str,
+    field_str,
     format_idle_children_nudge,
     format_idle_tasks_nudge,
     sanitize_name,
@@ -261,9 +261,9 @@ def render_tasks_body(envelope: dict[str, Any], *, strip_provenance: bool = Fals
 def render_children_body(children: list[dict[str, str]]) -> str:
     rows = [
         {
-            "ws_id": _field_str(c.get("ws_id")),
-            "name": _field_str(c.get("name")),
-            "state": _field_str(c.get("state")),
+            "ws_id": field_str(c.get("ws_id")),
+            "name": field_str(c.get("name")),
+            "state": field_str(c.get("state")),
         }
         for c in children
     ]

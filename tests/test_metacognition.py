@@ -14,9 +14,9 @@ from turnstone.core.metacognition import (
     NUDGE_START,
     NUDGE_TOOL_ERROR,
     RepeatDetector,
-    _field_str,
     detect_completion,
     detect_correction,
+    field_str,
     format_idle_children_nudge,
     format_idle_tasks_nudge,
     format_nudge,
@@ -658,10 +658,15 @@ class TestFormatIdleTasksNudge:
         work.  The blocked-on-child branch is the second escape hatch —
         after the operator one, before "take it"."""
         out = self._fmt([self._task()])
-        assert "child_ws_id='ws_...'" in out
+        # The example id is a BARE HEX string, matching uuid4().hex ids
+        # and the FE link regex /^[a-f0-9]{8,64}$/i.  A "ws_"-prefixed
+        # example taught the model an id shape renderTaskRow refuses to
+        # link — the very link this branch exists to create.
+        assert "child_ws_id='a1b2c3d4'" in out
+        assert "ws_..." not in out
         assert "wait_for_workstream" in out
-        assert out.index("needs_user") < out.index("child_ws_id='ws_...'")
-        assert out.index("child_ws_id='ws_...'") < out.index("If the next step is yours")
+        assert out.index("needs_user") < out.index("child_ws_id=")
+        assert out.index("child_ws_id=") < out.index("If the next step is yours")
 
     def test_never_asserts_children_are_done(self):
         """This nudge can fire ALONE while children run (the liveness
@@ -726,7 +731,7 @@ class TestFormatIdleTasksNudge:
 
 
 class TestFieldStrCoercion:
-    """``_field_str`` is the coercion the whole ragged-row class turns on.
+    """``field_str`` is the coercion the whole ragged-row class turns on.
 
     A bare ``str()`` is the BUG, not the fix: ``str(None)`` is the
     four-character ``"None"``, which is truthy and once rendered a
@@ -735,13 +740,13 @@ class TestFieldStrCoercion:
     """
 
     def test_none_becomes_empty_not_the_word_none(self):
-        assert _field_str(None) == ""
+        assert field_str(None) == ""
 
     def test_str_passes_through(self):
-        assert _field_str("hello") == "hello"
+        assert field_str("hello") == "hello"
 
     def test_non_string_coerces(self):
-        assert _field_str(42) == "42"
+        assert field_str(42) == "42"
 
     def test_formatter_tolerates_ragged_rows(self):
         """The formatter is public and directly callable, so it coerces

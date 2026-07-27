@@ -1085,9 +1085,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // class of notice ("you went idle with N outstanding") and share their
   // grouped CSS rules; sharing the builder keeps the DOM shape in
   // lockstep the same way — an accessibility attribute or scroll change
-  // lands on both or neither.  ``rows`` is ``[{name, state, note?}]``,
+  // lands on both or neither.  ``rows`` is
+  // ``[{name, state, note?, ident?}]``,
   // all fields pre-sanitized at the producer and rendered via
-  // textContent so hostile values are inert.  ``moreCount`` > 0 appends
+  // textContent so hostile values are inert.  Task rows additionally
+  // carry ``ident`` (the task id), rendered as a leading column so an
+  // untitled row is still identifiable.  ``moreCount`` > 0 appends
   // the overflow line so a capped list never reads as "that's all".
   // The wrappers below keep their full className/data-ts-role literals
   // — the test_coordinator_page pins grep for them.
@@ -1198,11 +1201,14 @@ function createCoordinatorPane(root, wsId, opts) {
   function appendIdleTasks(meta) {
     const tasks = Array.isArray(meta.tasks) ? meta.tasks : [];
     const total = typeof meta.total === "number" ? meta.total : tasks.length;
-    // The producer already applied the "(untitled)" fallback, so the card
-    // and the model-facing prose show the same label for every row; the
-    // id rides alongside as `ident` so an untitled row is still
-    // identifiable. Do NOT reintroduce a `|| t.id` fallback on `name` —
-    // that is what made the two surfaces disagree.
+    // The producer emits the RAW (sanitised) title, which may be empty;
+    // this card and the model-facing prose formatter each apply the same
+    // "(untitled)" fallback independently — pinned in lockstep by
+    // test_coordinator_page. The id rides alongside as `ident` so an
+    // untitled row is still identifiable in the card. Do NOT reintroduce
+    // a `|| t.id` fallback on `name`: `ident` is the id column now, and
+    // folding the id into the name is what made the two surfaces
+    // disagree.
     const rows = tasks.map((t) => ({
       ident: t && t.id ? String(t.id) : "",
       name: (t && t.title) || "(untitled)",
