@@ -12,7 +12,7 @@ import json
 import threading
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1538,6 +1538,91 @@ class TestCoDelivery:
 
         drained = ws.session._nudge_queue.drain({"any"})
         assert [d[0] for d in drained] == ["idle_tasks", "idle_children"]
+
+
+class TestFailureIsolationAndBudget:
+    """The two paths must not share a failure domain, and a refused
+    fire must not spend the cooldown.
+
+    Both defects were measured before the fix: an advice-path raise left
+    the queue EMPTY on an event with active children, and a charge
+    refusal still stamped the 300s window.
+    """
+
+    def test_advice_path_fault_does_not_suppress_the_liveness_wake(self, coord_setup):
+        """Per-type caps exist so the liveness budget is starvation-proof
+        against advice; a shared try block quietly broke that — one
+        advice fault stranded a coordinator whose children were live."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        with patch.object(
+            CoordinatorIdleObserver,
+            "_maybe_enqueue_tasks",
+            side_effect=RuntimeError("advice boom"),
+        ):
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_children"]
+
+    def test_liveness_path_fault_does_not_suppress_advice(self, coord_setup):
+        """The mirror: isolation is symmetric, not a one-way patch."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        _set_tasks(storage, _task("tsk_a", "in_progress"))
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        with patch.object(
+            CoordinatorIdleObserver,
+            "_maybe_enqueue_children",
+            side_effect=RuntimeError("liveness boom"),
+        ):
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        assert types == ["idle_tasks"]
+
+    def test_refused_charge_does_not_burn_the_cooldown(self, coord_setup):
+        """The cooldown is budget.  Recording at the permission check
+        spent 300s on a body the coordinator never received whenever the
+        authoritative charge refused — the loser of a concurrent cap
+        race (reachable via the force-cancel double-IDLE path, #922)
+        lost its NEXT fire too."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        with patch.object(CoordinatorIdleObserver, "_try_charge", return_value=False):
+            mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(ws.session._nudge_queue) == 0
+        assert ws.session._metacog_state.get("idle_children") is None
+
+    def test_delivered_fire_still_records_the_cooldown(self, coord_setup):
+        """The control the reorder could silently break: moving the
+        record must not DISABLE it, or every IDLE event re-fires."""
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws.session.messages = _assistant_turns("ok")
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        assert len(ws.session._nudge_queue) == 1
+        assert ws.session._metacog_state.get("idle_children") is not None
+        # ...and the recorded stamp actually suppresses the next event.
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 1
 
 
 class TestParkGates:

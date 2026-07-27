@@ -637,7 +637,7 @@ def _cooldown_allows(
     return time.monotonic() - last >= cooldown_secs
 
 
-def should_nudge(
+def nudge_allowed(
     nudge_type: str,
     state: dict[str, float],
     *,
@@ -645,7 +645,20 @@ def should_nudge(
     memory_count: int = 0,
     cooldown_secs: int = _COOLDOWN_SECS,
 ) -> bool:
-    """Check whether a nudge should fire, respecting cooldowns and context."""
+    """Every gate :func:`should_nudge` applies, WITHOUT recording a fire.
+
+    Split out so a producer with a further authoritative gate after this
+    one (the coordinator observer charges a per-type cap slot before it
+    enqueues) can ask "may this fire?" and record only once the fire
+    actually happened.  Recording earlier spends the cooldown on a nudge
+    that was never delivered.
+
+    Note the gates this applies that a bare ``_cooldown_allows`` peek
+    does NOT: unknown type, ``message_count <= 1``, the ``start``
+    first-message rule, and the memory-count requirements.  A caller
+    that charges budget before consulting THIS function would charge on
+    every one of those refusals.
+    """
     if nudge_type not in _NUDGE_MAP:
         return False
     # Don't nudge on the very first message (except resume/start)
@@ -661,11 +674,45 @@ def should_nudge(
     if nudge_type in ("resume", "start") and memory_count == 0:
         return False
     # Rate limit: one nudge per type per cooldown window
-    now = time.monotonic()
     last = state.get(nudge_type)
-    if last is not None and now - last < cooldown_secs:
+    return not (last is not None and time.monotonic() - last < cooldown_secs)
+
+
+def record_nudge(nudge_type: str, state: dict[str, float]) -> None:
+    """Stamp a fire, starting this type's cooldown window.
+
+    Call at the point the nudge is actually DELIVERED (enqueued), not
+    when it is merely permitted — see :func:`nudge_allowed`.
+    """
+    state[nudge_type] = time.monotonic()
+
+
+def should_nudge(
+    nudge_type: str,
+    state: dict[str, float],
+    *,
+    message_count: int = 0,
+    memory_count: int = 0,
+    cooldown_secs: int = _COOLDOWN_SECS,
+) -> bool:
+    """Check whether a nudge should fire, respecting cooldowns and context.
+
+    Records the fire timestamp on success — the check-and-stamp shape
+    every caller whose delivery immediately follows the check wants.
+    A caller with an authoritative gate BETWEEN the check and delivery
+    must use :func:`nudge_allowed` + :func:`record_nudge` instead, or a
+    refusal at that later gate burns the cooldown for a nudge nobody
+    received.
+    """
+    if not nudge_allowed(
+        nudge_type,
+        state,
+        message_count=message_count,
+        memory_count=memory_count,
+        cooldown_secs=cooldown_secs,
+    ):
         return False
-    state[nudge_type] = now
+    record_nudge(nudge_type, state)
     return True
 
 

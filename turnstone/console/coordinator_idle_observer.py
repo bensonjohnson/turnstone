@@ -56,15 +56,15 @@ The class decides three behaviours, each ruled at its site:
 
 Gate order, ``idle_children`` (cheap → expensive; matches the code):
 coordinator-kind → cooldown peek → cap peek → wait-tool skip →
-children query (``None``/``[]`` → no fire) → ``should_nudge`` →
-atomic charge → enqueue.
+children query (``None``/``[]`` → no fire) → permission check
+(``nudge_allowed``) → atomic charge → enqueue → record.
 
 Gate order, ``idle_tasks``: coordinator-kind → operator-Stop gate
 (``_generation_abandoned``) → ``_nudges_enabled`` (config +
 ``tasks``-tool visibility) → cooldown peek → cap peek →
 asked-operator skip → wait-tool skip → envelope read →
-unidentifiable-set refusal (``bound_open_ids``) → ``should_nudge`` →
-atomic charge → enqueue.
+unidentifiable-set refusal (``bound_open_ids``) → permission check
+(``nudge_allowed``) → atomic charge → enqueue → record.
 
 ``_on_idle`` runs the tasks path BEFORE the children path so a
 same-event pair carries ascending seq in tasks-first order — every
@@ -94,8 +94,9 @@ from turnstone.core.metacognition import (
     _field_str,
     format_idle_children_nudge,
     format_idle_tasks_nudge,
+    nudge_allowed,
+    record_nudge,
     sanitize_name,
-    should_nudge,
 )
 from turnstone.core.trajectory import Role
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
@@ -278,8 +279,32 @@ class CoordinatorIdleObserver:
         # check above does not reach into the paths' closures.
         session = ws.session
 
-        self._maybe_enqueue_tasks(ws, session)
-        self._maybe_enqueue_children(ws, session)
+        # SEPARATE failure domains, deliberately two literal statements.
+        #
+        # The classes are independent by design — per-type caps exist so
+        # the liveness budget is starvation-proof against advice — and a
+        # shared ``try`` silently broke that: any raise inside the advice
+        # path (an unregistered type KeyError from ``_NUDGE_TYPE_CAPS``, a
+        # ragged envelope value, a non-mapping config row escaping
+        # ``load_task_envelope``) suppressed the liveness WAKE for the
+        # same event, stranding a coordinator whose children finish
+        # unobserved.  That is the outcome the liveness class exists to
+        # prevent, caused by the class it is supposed to be independent
+        # of.
+        #
+        # Do NOT "tidy" these into a loop or a list of callables: the
+        # tasks-then-children ORDER is the co-delivery ruling (tasks
+        # enqueues first so it carries the lower seq and the batch ends
+        # on the park instruction), and a collection makes that order an
+        # accident of iteration rather than a statement.
+        try:
+            self._maybe_enqueue_tasks(ws, session)
+        except Exception:
+            log.exception("coord_idle_observer.advice_path_failed ws=%s", ws_id[:8])
+        try:
+            self._maybe_enqueue_children(ws, session)
+        except Exception:
+            log.exception("coord_idle_observer.liveness_path_failed ws=%s", ws_id[:8])
 
     # ------------------------------------------------------------------
     # shared gate head / enqueue tail
@@ -289,7 +314,7 @@ class CoordinatorIdleObserver:
         """The gate head both paths run identically: cooldown peek +
         per-type cap peek, both microsecond dict lookups.
 
-        Returns the cooldown seconds (``should_nudge`` needs the same
+        Returns the cooldown seconds (``nudge_allowed`` needs the same
         number again) when the gates pass, ``None`` when blocked.  Kept
         in one place so a cross-cutting change to the cheap gates lands
         on both nudge types at once — this file has already paid once
@@ -313,22 +338,22 @@ class CoordinatorIdleObserver:
         valid_until: Callable[[], bool],
         cooldown_secs: int,
     ) -> bool:
-        """The shared enqueue tail: ``should_nudge`` (the authoritative
-        cooldown check that also RECORDS the timestamp), the formatter
-        empty-body guard, the atomic cap charge, and the enqueue itself.
+        """The shared enqueue tail: ``nudge_allowed`` (the authoritative
+        permission check), the formatter empty-body guard, the atomic
+        cap charge, the enqueue, and finally ``record_nudge``.
 
         One implementation for both types so the charge discipline —
         cheap peek early, authoritative :meth:`_try_charge` at the fire
         position — can never drift between paths.
 
-        ``memory_count=0`` is deliberate, not a stub: ``should_nudge``
+        ``memory_count=0`` is deliberate, not a stub: ``nudge_allowed``
         reads ``memory_count`` only for the ``tool_error`` / ``resume``
         / ``start`` types, so paying 1-2 ``count_structured_memories``
         round-trips per IDLE event to compute the real number bought
         nothing.  If a future nudge type routed through here needs it,
         thread it explicitly.
         """
-        if not should_nudge(
+        if not nudge_allowed(
             nudge_type,
             session._metacog_state,
             message_count=len(session.messages),
@@ -348,6 +373,18 @@ class CoordinatorIdleObserver:
             valid_until=valid_until,
             metadata=metadata,
         )
+        # Record LAST — the cooldown is budget, and a refused fire must
+        # never burn it.  ``should_nudge`` stamps on success, so calling
+        # it here would spend the 300s window at the permission check,
+        # before ``_try_charge`` (the authoritative gate) has said yes:
+        # the loser of a cap race then loses its next fire too, having
+        # delivered nothing.  Reordering the CHARGE above the permission
+        # check instead would be worse — ``nudge_allowed`` refuses for
+        # reasons the cheap peek never sees (``message_count <= 1`` on a
+        # rehydrated session, an unregistered type), so the cap would be
+        # charged on every one of those refusals.  Permission, then
+        # charge, then deliver, then record.
+        record_nudge(nudge_type, session._metacog_state)
         return True
 
     # ------------------------------------------------------------------
