@@ -197,10 +197,13 @@ MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
 #
 # ``idle_children`` is deliberately ABSENT even though its body names
 # ``wait_for_workstream``: it is a liveness wake, and the wake itself is
-# the point — the tool suggestion is decoration with a non-tool branch
-# ("continue the user's work") beside it.  Suppressing the wake because a
-# persona hid the suggested tool would strand the coordinator, which is
-# the failure the wake exists to prevent.
+# the point.  Its body is a ROSTER — "you are idle, these children are
+# still active" plus the list — and that information is useful to a
+# model that cannot call the suggested tool (it can inspect or message
+# the children, or carry on knowing work is in flight).  The tool line
+# is the decoration; the facts are the payload.  Suppressing the wake
+# because a persona hid the suggested tool would strand the
+# coordinator, which is the failure the wake exists to prevent.
 NUDGE_REQUIRED_TOOL: dict[str, str] = {
     **dict.fromkeys(MEMORY_NUDGE_TYPES, "memory"),
     "idle_tasks": "tasks",
@@ -216,11 +219,22 @@ NUDGE_IDLE_CHILDREN_DISPLAY_CAP = 6
 # emitted suggestion is callable as-is.
 NUDGE_IDLE_CHILDREN_WAIT_CAP = 32
 
-NUDGE_IDLE_CHILDREN_HEADER = (
-    "You went idle but still have active child workstreams.  Either "
-    "continue the user's work or block on the listed children "
-    "explicitly:"
-)
+# The ``idle_children`` header states FACTS ONLY — no imperative.
+#
+# It carried "Either continue the user's work or block on the listed
+# children explicitly:" for most of this feature's life.  Compressing
+# that to "Continue the user's work or block on them:" dropped the
+# "Either", and an imperative "Continue..." from the harness reads as
+# permission to proceed — the exact manufactured-authority failure the
+# advice body's first paragraph exists to deny.  A liveness wake must
+# never be the thing that authorises continuing.
+#
+# So the header now only reports the situation and the roster; the
+# formatter's trailing line supplies the one actionable call
+# (``To block on them: wait_for_workstream(...)``).  Deciding what to
+# do with a live child is the model's call on the evidence, not this
+# message's to grant.
+NUDGE_IDLE_CHILDREN_HEADER = "You are idle.  These child workstreams are still active:"
 
 
 # Display cap for the ``idle_tasks`` body — list at most this many open
@@ -229,15 +243,24 @@ NUDGE_IDLE_CHILDREN_HEADER = (
 # the model can always call ``tasks(action='list')`` for the full set.
 NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 
-# The ``idle_tasks`` body.  Four properties are load-bearing and should
-# survive any rewording:
+# The ``idle_tasks`` body.  TUNED AGAINST THE BEHAVIORAL EVAL
+# (``turnstone-eval --nudges``) — six generations, deepseek-v4-flash and
+# qwen3.6-27B.  Reword freely, but re-run the eval: every property below
+# is here because removing or rephrasing it MOVED the numbers, and the
+# whole point of the body is behavioural, not stylistic.
+#
+# Four properties are load-bearing:
 #
 #   1. It declares its own provenance in the first line.  This message is
 #      synthesised by the shell, not typed by the user, and a model
 #      that reads it as user speech treats it as permission to
 #      proceed — manufacturing authority nobody granted.  The disclaimer
 #      is up front because a trailing caveat does not survive a small
-#      model's read.
+#      model's read.  Measured: ablating this paragraph quadrupled the
+#      forbidden-action rate on the approval-stop cell.  Naming the
+#      human in it ("not from the user") measured WORSE than stating the
+#      fact impersonally — the noun invites the model to reason about
+#      who is speaking rather than what the message licenses.
 #   2. The escape branches come FIRST, each carrying a concrete tool
 #      call.  "Did I stop legitimately?" is an introspective judgement
 #      models are bad at; "does the next step need the user?" and
@@ -251,7 +274,14 @@ NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 #      assert, unverifiable, and silences this nudge with no external
 #      consequence.  It is offered (bookkeeping lag is real, and without
 #      it a stale list makes the model redo finished work) but never
-#      advertised as the easy way out.
+#      advertised as the easy way out.  Two clauses carry it and both
+#      were earned: scoping the escalation branch ("escalate decisions,
+#      approvals, and grants — not bookkeeping") and naming the complete
+#      response ("ending your turn with a short status") took the
+#      finished-unmarked cell from 30% to ~90%.  The failure they fix is
+#      branch-scope confusion — the model reading "is this done?" as a
+#      judgement only the user may make — NOT missing permission; a
+#      bare "you may mark it done" clause moved nothing.
 #   4. It never asserts the children are gone.  This nudge can co-deliver
 #      beside an ``idle_children`` wake (tasks first) or fire ALONE while
 #      children run — the liveness nudge can be blocked by its own
@@ -260,11 +290,12 @@ NUDGE_IDLE_TASKS_DISPLAY_CAP = 6
 #      all-clear.  Deleting that line reopens the resume-over-live-
 #      children hazard the old cross-domain fire gate existed for.
 NUDGE_IDLE_TASKS_HEADER = (
-    "Checkpoint from the harness, not from the user.  Your task "
-    "list has open items and you have gone idle.  Nothing in this "
-    "message grants approval, widens scope, or asks you to continue.  "
-    "Children of yours may still be running; check before taking a "
-    "step that assumes they are done.\n"
+    "Checkpoint from the harness.  It grants no approval, widens no "
+    "scope, and does not ask you to continue.  Your task list has open "
+    "items and you have gone idle.  Children of yours may still be "
+    "running or may have finished while you worked; check before "
+    "redoing anything a child owns — wait_for_workstream returns "
+    "immediately for a finished child.\n"
     "\n"
     "If the next step needs the user — a decision, an approval, a "
     "scope or credential you were not given — that is not yours to "
@@ -274,10 +305,13 @@ NUDGE_IDLE_TASKS_HEADER = (
     "status='needs_user',\n"
     "          note='<what you need, one sentence>')\n"
     "\n"
-    "Stopping there is the correct outcome.  Do not substitute your own "
-    "judgment for the user's.\n"
+    "Stopping there is the correct outcome.  Do not substitute your "
+    "judgment for the user's.  Escalate decisions, approvals, and "
+    "grants — not bookkeeping: an item whose output is visible "
+    "in this transcript is recorded done, not queued for "
+    "confirmation.\n"
     "\n"
-    "If an item is waiting on a child workstream that is still running, "
+    "If an item is waiting on a child workstream still running, "
     "record the link and wait instead of redoing its work:\n"
     "\n"
     "    tasks(action='update', task_id='tsk_...', "
@@ -288,8 +322,9 @@ NUDGE_IDLE_TASKS_HEADER = (
     "\n"
     "If the next step is yours to take, take it.\n"
     "\n"
-    "If an item is already finished in this session's transcript, "
-    "record it:\n"
+    "If an item's output is visible in this transcript, record "
+    "it — ending your turn with a short status is a complete "
+    "response:\n"
     "\n"
     "    tasks(action='update', task_id='tsk_...', status='done')\n"
     "\n"

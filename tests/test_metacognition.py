@@ -623,13 +623,19 @@ class TestFormatIdleTasksNudge:
         assert "(pending)" in out
         assert "audit auth.py" in out
 
-    def test_disclaims_operator_authority(self):
-        """A nudge read as operator speech manufactures approval nobody
+    def test_disclaims_authority_impersonally(self):
+        """A nudge read as user speech manufactures approval nobody
         granted — the disclaimer is the whole reason this body differs
-        from a plain 'you have unfinished tasks' reminder."""
+        from a plain 'you have unfinished tasks' reminder.
+
+        Stated IMPERSONALLY ("it grants no approval"), not by naming the
+        human: the eval measured a body saying "not from the user" as
+        strictly worse — the noun invites the model to reason about who
+        is speaking instead of what the message licenses.
+        """
         out = self._fmt([self._task()])
-        assert "not from the user" in out
-        assert "grants approval" in out
+        assert "Checkpoint from the harness" in out
+        assert "grants no approval" in out
 
     def test_escape_branch_precedes_resume_branch(self):
         """Branch order follows harm: guessing on an operator decision is

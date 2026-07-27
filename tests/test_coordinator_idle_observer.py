@@ -1053,8 +1053,8 @@ class TestNudgesDisabledSwitch:
 
     def test_children_fire_even_when_persona_hides_wait_tool(self, coord_setup):
         """Liveness is NOT visibility-gated: the wake itself is the
-        point, and the body has a non-tool branch ("continue the user's
-        work") beside the ``wait_for_workstream`` suggestion."""
+        point, and the body is a roster — the child list stays useful
+        to a model that cannot call the suggested tool."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         ws.session.messages = _assistant_turns("ok")

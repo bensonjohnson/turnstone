@@ -133,12 +133,12 @@ class TestStimulus:
         assert "tsk_1" in body and "audit auth.py" in body
         assert "may still be running" in body
         assert "needs_user" in body
-        assert "not from the user" in body
+        assert "Checkpoint from the harness" in body
 
     def test_no_provenance_arm_drops_only_the_first_paragraph(self):
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
         body = render_tasks_body(env, strip_provenance=True)
-        assert "not from the user" not in body
+        assert "Checkpoint from the harness" not in body
         assert "may still be running" not in body  # rides the provenance paragraph
         assert "needs_user" in body and "tsk_1" in body
 

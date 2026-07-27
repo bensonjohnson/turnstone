@@ -372,13 +372,13 @@ class CoordinatorIdleObserver:
 
         The body suggests ``wait_for_workstream`` but the wake fires
         even for a persona that hides that tool: the wake itself is the
-        point — the model can also continue the user's work, inspect or
-        message the children — and the tool line is decoration.  This
+        point, and the body is a ROSTER — the child list is useful to a
+        model that cannot call the suggested tool (inspect or message
+        them, or simply carry on knowing work is in flight).  This
         asymmetry with the advice path (which IS visibility-gated) is
-        deliberate: every ACTIONABLE call in the advice body is a
-        ``tasks(...)`` call (its ``wait_for_workstream`` mention is the
-        same decoration this body carries), while the liveness body has
-        a non-tool branch.
+        deliberate: every ACTIONABLE line in the advice body is a
+        ``tasks(...)`` call, so hiding ``tasks`` leaves it with nothing
+        to say, while the liveness body still carries its facts.
         """
         ws_id = ws.id
 
